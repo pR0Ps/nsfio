@@ -1,77 +1,43 @@
 #!/usr/bin/env python
 
+"""AES-128 CTR and XTS implementations"""
 from binascii import hexlify as hx
 from binascii import unhexlify as uhx
 
-# Pure python AES128 implementation
-# SciresM, 2017
-from struct import pack as pk
-from struct import unpack as up
+from struct import pack
+from struct import unpack
 
 from Crypto.Cipher import AES
 from Crypto.Util import Counter
 
 
 def sxor(s1, s2):
+    """Xor two strings"""
     assert len(s1) == len(s2)
-    return b"".join([pk("B", x ^ y) for x, y in zip(s1, s2)])
-
-
-class AESCBC:
-    """Class for performing AES CBC cipher operations."""
-
-    def __init__(self, key, iv):
-        self.aes = AESECB(key)
-        if len(iv) != self.aes.block_size:
-            raise ValueError("IV must be of size %X!" % self.aes.block_size)
-        self.iv = iv
-
-    def encrypt(self, data, iv=None):
-        """Encrypts some data in CBC mode."""
-        if iv is None:
-            iv = self.iv
-        out = b""
-        while data:
-            encb = self.aes.encrypt_block_ecb(sxor(data[:0x10], iv))
-            out += encb
-            iv = encb
-            data = data[0x10:]
-        return out
-
-    def decrypt(self, data, iv=None):
-        """Decrypts some data in CBC mode."""
-        if len(data) % self.aes.block_size:
-            raise ValueError("Data is not aligned to block size!")
-        if iv is None:
-            iv = self.iv
-        out = b""
-        while data:
-            decb = sxor(self.aes.decrypt_block_ecb(data[:0x10]), iv)
-            out += decb
-            iv = data[:0x10]
-            data = data[0x10:]
-        return out
-
-    def set_iv(self, iv):
-        if len(iv) != self.aes.block_size:
-            raise ValueError("IV must be of size %X!" % self.aes.block_size)
-        self.iv = iv
+    return b"".join([pack("B", x ^ y) for x, y in zip(s1, s2)])
 
 
 class AESCTR:
     """Class for performing AES CTR cipher operations."""
 
-    def __init__(self, key, nonce, offset=0):
+    def __init__(self, key, nonce):
         self.key = key
         self.nonce = nonce
-        self.seek(offset)
+        if len(nonce) != 0x10:
+            raise ValueError("Nonce must be of size {:#x}".format(0x10))
+        self.seek(0)
 
     def encrypt(self, data, ctr=None):
+        """Encrypt some data in CTR mode"""
         if ctr is None:
             ctr = self.ctr
         return self.aes.encrypt(data)
 
     def decrypt(self, data, ctr=None):
+        """Decrypts some data in CTR mode.
+
+        This is identical to encryption (CTR mode is symmetric)
+        """
         return self.encrypt(data, ctr)
 
     def seek(self, offset):
@@ -87,41 +53,42 @@ class AESCTR:
         self.aes = AES.new(self.key, AES.MODE_CTR, counter=self.ctr)
 
 
+# Pure python AES128-XTR implementation - SciresM, 2017
 class AESXTS:
     """Class for performing AES XTS cipher operations"""
 
-    def __init__(self, keys, sector=0):
-        self.keys = keys[:16], keys[16:]
-        if not (type(self.keys) is tuple and len(self.keys) == 2):
-            raise TypeError("XTS mode requires a tuple of two keys.")
-        self.K1 = AESECB(self.keys[0])
-        self.K2 = AESECB(self.keys[1])
+    def __init__(self, keys: bytes, initial_sector=0, sector_size=0x200):
+        self._initial_sector = initial_sector
+        self.sector_size = sector_size
+        self.set_sector(0)
 
-        self.sector = sector
-        self.block_size = self.K1.block_size
+        self.block_key = AESECB(keys[:16])
+        self.tweak_key = AESECB(keys[16:])
 
-        self.sector_size = 0x200
+        self.block_size = self.block_key.block_size
 
-    def encrypt(self, data, sector=None):
-        if sector is None:
-            sector = self.sector
+    def encrypt(self, data):
+        """Encrypt data in XTS mode
+
+        WARNING: Make sure the sector size is set properly using seek / set_sector
+        """
         if len(data) % self.block_size:
             raise ValueError("Data is not aligned to block size!")
         out = b""
         while data:
-            tweak = self.get_tweak(sector)
+            tweak = self.get_tweak(self.sector)
             out += self.encrypt_sector(data[: self.sector_size], tweak)
             data = data[self.sector_size :]
-            sector += 1
+            self.sector += 1
         return out
 
     def encrypt_sector(self, data, tweak):
         if len(data) % self.block_size:
             raise ValueError("Data is not aligned to block size!")
         out = b""
-        tweak = self.K2.encrypt(uhx("%032X" % tweak))
+        tweak = self.tweak_key.encrypt(uhx("%032X" % tweak))
         while data:
-            out += sxor(tweak, self.K1.encrypt(sxor(data[:0x10], tweak)))
+            out += sxor(tweak, self.block_key.encrypt(sxor(data[:0x10], tweak)))
             _t = int(hx(tweak[::-1]), 16)
             _t <<= 1
             if _t & (1 << 128):
@@ -130,26 +97,28 @@ class AESXTS:
             data = data[0x10:]
         return out
 
-    def decrypt(self, data, sector=None):
-        if sector is None:
-            sector = self.sector
+    def decrypt(self, data):
+        """Decrypt data in XTS mode
+
+        WARNING: Make sure the sector size is set properly using seek / set_sector
+        """
         if len(data) % self.block_size:
             raise ValueError("Data is not aligned to block size!")
         out = b""
         while data:
-            tweak = self.get_tweak(sector)
+            tweak = self.get_tweak(self.sector)
             out += self.decrypt_sector(data[: self.sector_size], tweak)
             data = data[self.sector_size :]
-            sector += 1
+            self.sector += 1
         return out
 
     def decrypt_sector(self, data, tweak):
         if len(data) % self.block_size:
             raise ValueError("Data is not aligned to block size!")
         out = b""
-        tweak = self.K2.encrypt(uhx("%032X" % tweak))
+        tweak = self.tweak_key.encrypt(uhx("%032X" % tweak))
         while data:
-            a = self.K1.decrypt(sxor(data[:0x10], tweak))
+            a = self.block_key.decrypt(sxor(data[:0x10], tweak))
             out += sxor(tweak, a)
             _t = int(hx(tweak[::-1]), 16)
             _t <<= 1
@@ -168,94 +137,19 @@ class AESXTS:
             sector >>= 8
         return tweak
 
-    def set_sector(self, sector):
-        self.sector = sector
+    def seek(self, offset):
+        """Set the sector based on the offset into the encrypted data
 
-
-class AESXTSN:
-    """Class for performing Nintendo AES XTS cipher operations"""
-
-    def __init__(self, keys, sector_size=0x200, sector=0):
-        if not (type(keys) is tuple and len(keys) == 2):
-            raise TypeError("XTS mode requires a tuple of two keys.")
-        self.K1 = AESECB(keys[0])
-        self.K2 = AESECB(keys[1])
-        self.keys = keys
-        self.sector = sector
-        self.sector_size = sector_size
-        self.block_size = self.K1.block_size
-
-    def encrypt(self, data, sector=None):
-        if sector is None:
-            sector = self.sector
-        if len(data) % self.block_size:
-            raise ValueError("Data is not aligned to block size!")
-        out = b""
-        while data:
-            tweak = self.get_tweak(sector)
-            out += self.encrypt_sector(data[: self.sector_size], tweak)
-            data = data[self.sector_size :]
-            sector += 1
-        return out
-
-    def encrypt_sector(self, data, tweak):
-        if len(data) % self.block_size:
-            raise ValueError("Data is not aligned to block size!")
-        out = b""
-        tweak = self.K2.encrypt(uhx("%032X" % tweak))
-        while data:
-            out += sxor(tweak, self.K1.encrypt_block_ecb(sxor(data[:0x10], tweak)))
-            _t = int(hx(tweak[::-1]), 16)
-            _t <<= 1
-            if _t & (1 << 128):
-                _t ^= (1 << 128) | (0x87)
-            tweak = uhx("%032X" % _t)[::-1]
-            data = data[0x10:]
-        return out
-
-    def decrypt(self, data, sector=None):
-        if sector is None:
-            sector = self.sector
-        if len(data) % self.block_size:
-            raise ValueError("Data is not aligned to block size!")
-        out = b""
-        while data:
-            tweak = self.get_tweak(sector)
-            out += self.decrypt_sector(data[: self.sector_size], tweak)
-            data = data[self.sector_size :]
-            sector += 1
-        return out
-
-    def decrypt_sector(self, data, tweak):
-        if len(data) % self.block_size:
-            raise ValueError("Data is not aligned to block size!")
-        out = b""
-        tweak = self.K2.encrypt(uhx("%032X" % tweak))
-        while data:
-            out += sxor(tweak, self.K1.decrypt_block_ecb(sxor(data[:0x10], tweak)))
-            _t = int(hx(tweak[::-1]), 16)
-            _t <<= 1
-            if _t & (1 << 128):
-                _t ^= (1 << 128) | (0x87)
-            tweak = uhx("%032X" % _t)[::-1]
-            data = data[0x10:]
-        return out
-
-    def get_tweak(self, sector=None):
-        """Gets tweak for use in XEX."""
-        if sector is None:
-            sector = self.sector
-        tweak = 0
-        for i in range(self.block_size):
-            tweak |= (sector & 0xFF) << (i * 8)
-            sector >>= 8
-        return tweak
+        (will be set relative to the initial sector)
+        """
+        self.set_sector(offset // self.sector_size)
 
     def set_sector(self, sector):
-        self.sector = sector
+        """Set the sector
 
-    def set_sector_size(self, sector_size):
-        self.sector_size = sector_size
+        (will be set relative to the initial sector)
+        """
+        self.sector = self._initial_sector + sector
 
 
 class AESECB:
@@ -453,7 +347,7 @@ class AESECB:
         self.block_size, self.num_rounds = 0x10, 10  # 128-bit AES
         if len(key) != self.block_size:
             raise ValueError("Key must be of size %X!" % self.block_size)
-        self.keys = [list(up(">IIII", key))]
+        self.keys = [list(unpack(">IIII", key))]
         for i in range(1, self.num_rounds + 1):
             new_key = [self.key_schedule_core(self.keys[i - 1][3], i) ^ self.keys[i - 1][0]]
             for j in range(1, 4):
@@ -479,7 +373,7 @@ class AESECB:
         return out
 
     def encrypt_block_ecb(self, block):
-        words = list(up(">IIII", self.pad_block(block)))
+        words = list(unpack(">IIII", self.pad_block(block)))
         for i in range(len(words)):
             words[i] ^= self.keys[0][i]
         for rnd in range(1, self.num_rounds + 1):
@@ -490,11 +384,11 @@ class AESECB:
                 words = self.mix_columns(words)
             for i in range(len(words)):
                 words[i] ^= self.keys[rnd][i]
-        return pk(">IIII", words[0], words[1], words[2], words[3])
+        return pack(">IIII", words[0], words[1], words[2], words[3])
 
     def decrypt_block_ecb(self, block):
         assert len(block) == self.block_size
-        words = list(up(">IIII", block))
+        words = list(unpack(">IIII", block))
         for rnd in range(self.num_rounds, 0, -1):
             for i in range(len(words)):
                 words[i] ^= self.keys[rnd][i]
@@ -505,7 +399,7 @@ class AESECB:
                 words[i] = self.send_through_sbox(words[i], self.sbox_dec)
         for i in range(len(words)):
             words[i] ^= self.keys[0][i]
-        return pk(">IIII", words[0], words[1], words[2], words[3])
+        return pack(">IIII", words[0], words[1], words[2], words[3])
 
     # Helper functions
     def rotate_op(self, word):

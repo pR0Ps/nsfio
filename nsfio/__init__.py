@@ -60,87 +60,6 @@ class TicketSignatureType(IntEnum):
 
 #########################################
 
-@dataclass
-class EncryptionScheme:
-    method: EncryptionType
-    key: bytes
-    iv: None
-
-def is_po2(num):
-    return num > 0 and (num & (num-1) == 0)
-
-
-class EncryptionBuffer(io.BufferedIOBase):
-    """Sits between the raw io interface and applies encryption if required"""
-
-    # TODO: optimize by allowing the buffer to be bigger
-    #       (right now it's just a single sector)
-
-    def __init__(self, raw: io.BufferedIOBase, sector_size):
-        if not is_po2(sector_size):
-            raise ValueError("Sector size must be a power of 2")
-
-        self._raw = raw
-        self._sector_size = sector_size
-
-        rawpos = self._raw.tell()
-
-        self._buff = None # Data contained in the buffer
-        self._buf_offset = None # The offset of the buffer (aligned to sector size)
-        self._offset = None # The current position within the buffer
-        self._dirty = False # the buffer was modified and needs to be written back
-
-        # This class is just a passthrough until encryption is enabled
-        self.encryption = False
-
-    def sector_offset(self, offset):
-        """Offset aligned to the sector_size"""
-        return offset & ~(self._sector_size-1)
-
-    def relative_offset(self, offset):
-        """Position relative to the current sector offset"""
-        return offset & ~-self._sector_size
-
-    def _sync(self):
-        """Sync any written data back to the raw io"""
-        if self._dirty:
-            p = self.tell()
-            self._raw.seek(0) # TODO: seek to sector start, not 0
-            self._raw.write("") # TODO: encrypt bytes
-            self.seek(p)
-
-    def flush(self):
-        if self.encryption:
-            self._sync()
-        self._raw.flush()
-
-    def close(self):
-        self.flush()
-        self._raw.close()
-
-    def tell(self):
-        return self._raw.tell()
-
-    def seek(self, pos, whence=io.SEEK_SET):
-        if not self.encryption:
-            return self._raw.seek(pos, whence)
-        # TODO
-
-    def read(self, size=None):
-        if not self.encryption:
-            return self._raw.read(size)
-
-        raise NotImplementedError("Reading encrypted data is not implemented")
-
-    def write(self, b: bytes):
-        if not self.encryption:
-            return self._raw.write(b)
-        self._dirty = True
-        p = self.tell()
-        # TODO: store write in buffer
-        #       (break up into sector_size'd chunks and write them individually)
-        raise NotImplementedError("Writing encrypted data is not implemented")
-
 
 class BaseIO:
     """Base class of all IO-related classes
@@ -153,17 +72,16 @@ class BaseIO:
 
     # TODO: Handle unbounded size for objects (writing a filesystem?)
 
-    # TODO: Handle crypto transparently (decrypt on read, encrypt on write)
-    # write a "middleware" that decrypts/encrypts the requested data (block-based)
-
-    def __init__(self, size=None, *args, **kwargs):
+    def __init__(self, *, size=None, console_keys: ConsoleKeys = None, **kwargs):
         """Store how to parse the file"""
         if size is None and self.static_size:
             size = self.static_size
         self._io = None
         self._offset = 0
         self._size = size
+        self._console_keys = console_keys
         self._children = []
+        self._parent = None
 
     # Load data and parse
     def from_io(self, data: io.BufferedIOBase):
@@ -177,25 +95,46 @@ class BaseIO:
         return self
 
     def from_file(self, path: Union[str, Path]):
-        self.from_io(open(path, 'rb'))
-        return self
+        with open(path, 'rb') as fp:
+            return self.from_io(fp)
 
     def from_bytes(self, data: Union[bytes, bytearray]):
-        self.from_io(io.BytesIO(data))
+        return self.from_io(io.BytesIO(data))
+
+    #TODO: API?
+    def to_io(self, data: io.BufferedIOBase):
+        self._io = data
+        self._io.seek(0)
+        self.serialize()
+        self.flush()
         return self
+
+    def to_file(self, path: Union[str, Path]):
+        with open(path, 'wb') as fp:
+            return self.to_io(fp)
 
     @property
     def size(self):
         return self._size
+
+    @property
+    def console_keys(self):
+        return self._console_keys
+
+    @property
+    def parent(self):
+        return self._parent
 
     # Define how to parse/serialize
     def parse(self):
         """Parse information out of the loaded stream"""
         __log__.error("Parsing not implemented for {} objects".format(self.__class__.__qualname__))
 
-    def serialize(self, fp):
-        """Using the stored data, serialize a bytestream and write it to fp"""
-        __log__.error("Serialization not implemented for {} objects".format(self.__class__.__qualname__))
+    def serialize(self):
+        """Using the stored data, write to the stream"""
+        raise NotImplementedError(
+            "Serialization not implemented for {} objects".format(self.__class__.qualname__)
+        )
 
     def parse_object(self, instance, offset=None):
         """Parse an object from the bytestream"""
@@ -209,15 +148,15 @@ class BaseIO:
             offset = self.tell()
 
         # Transfer attributes to the new object
-        instance.parent = self
+        instance._parent = self
         instance._io = self._io
         instance._offset = self._offset + offset
+        instance._console_keys = self.console_keys
 
         self._children.append(instance)
 
         instance.seek(0)
         instance.parse()
-        print(instance)
         instance.seek(0, io.SEEK_END)
 
         return instance
@@ -246,6 +185,7 @@ class BaseIO:
             raise IOError("Offset {:#x} is out of range (0 - {:#x} @ {:#x})".format(target - self._offset, self.size, self._offset))
 
     # Methods to interact with the underlying io object
+    # TODO: This should propagate up using self.parent.read()
     def read(self, size=None):
         if size is None:
             size = self.size - self.tell()
@@ -291,7 +231,7 @@ class BaseIO:
 
     def write(self, b: bytes):
         self._check_offset(self._io.tell() + len(b))
-        self._io.write(b)
+        return self._io.write(b)
 
     def seek(self, offset, whence=io.SEEK_SET):
         if whence == io.SEEK_SET:
@@ -325,6 +265,183 @@ class BaseIO:
     def flush(self):
         if self._io:
             self._io.flush()
+
+
+@dataclass
+class EncryptionScheme:
+    method: EncryptionType
+
+    # The key(s) to use.
+    # For XTS this is the block key + tweak key (128 bits/16 bytes each)
+    # For CBC it's a single key equal the the block size (128 bits/16 bytes)
+    key: bytes
+
+    # The sector size for XTS mode
+    sector_size: int = SECTOR_SIZE
+
+    # For XTS this is a sector number, for CBC it's a nonce/iv
+    iv: Union[int, bytes] = None
+
+
+def is_power_of_2(num: int):
+    return num > 0 and (num & (num-1) == 0)
+
+
+class EncryptedBaseIO(BaseIO):
+    """Transparently applies block-based encryption on read/write if required
+
+    Pages data in and out of the buffer as it's requested
+    """
+
+    def __init__(self, *args, encryption: EncryptionScheme = None, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self._buff : bytearray = None # Data contained in the buffer
+        self._buff_offset = None # The offset of the buffer (aligned to sector size)
+        self._dirty = False # the buffer was modified and needs to be written back
+
+        # Always load this amount of data into the buffer, regardless of what's requested.
+        # Should be a multiple of the alignment (sector size for XTS, block size for CBC/CTR/ECB)
+        # for best performance (keeps writes aligned in the buffer)
+        self.min_buffer_size = 0x1000 # 4KB
+
+        # Set up encryption
+        # If encryption is None/invalid then all I/O operations are just passed through
+        # to the superclass.
+        self._crypt = None
+        self._alignment = None
+        self._setup_encryption(encryption)
+
+    @property
+    def alignment(self):
+        return self._alignment
+
+    def _setup_encryption(self, encryption):
+        __log__.debug("Setting up encryption for %s: %s", self, encryption)
+        if not encryption:
+            self._crypt = None
+
+        if encryption.method == EncryptionType.AES_XTS:
+            if not is_power_of_2(encryption.sector_size):
+                raise ValueError("Sector size must be a power of 2")
+
+            self._alignment = encryption.sector_size
+            self._crypt = aes128.AESXTS(
+                keys=encryption.key,
+                initial_sector=encryption.iv or 0,
+                sector_size=self._alignment
+            )
+        elif encryption.method in (EncryptionType.CTR, EncryptionType.CTR_EX):
+            # TODO: test
+            # Key size must be equal to block size
+            # (should always be 128 bits/16 bytes which the crypt init will check)
+            self._alignment = len(encryption.key)
+            self._crypt = aes128.AESCTR(key=encryption.key, nonce=encryption.iv)
+        else:
+            self._crypt = None
+
+    def sector_align(self, offset, upper=False):
+        """Align the offset to a sector"""
+        if upper:
+            offset += self.alignment - 1
+        return offset & ~(self.alignment-1)
+
+    def relative_offset(self, offset):
+        """The offset relative to its lower sector boundry"""
+        return offset & ~-self.alignment
+
+    def _load_buffer(self, offset, size):
+        """Load data into the buffer
+
+        Will start at the first sector that contains the offset and go until
+        all the bytes requested by the size have been read.
+        """
+        # Check if already loaded
+        if (
+            self._buff and
+            self._buff_offset <= offset and
+            self._buff_offset + len(self._buff) >= offset + size
+        ):
+            return
+
+        # Need to read something new into the buffer - sync the current one
+        self._sync()
+
+        # Future optimization: avoid re-reading and re-decrypting any overlapping sectors
+
+        # Align the starting offset back, increase the size to compansate
+        # Align the amount requested with the upper sector boundry
+        self._buff_offset = self.sector_align(offset)
+        aligned_read = self.sector_align(
+            max(size + self.relative_offset(offset), self.min_buffer_size),
+            upper=True
+        )
+
+        # Don't read past EOF
+        actual_read = min(aligned_read, self.size - self._buff_offset)
+
+        self.seek(self._buff_offset)
+        self._crypt.seek(self._buff_offset)
+        self._buff = bytearray(self._crypt.decrypt(super().read(actual_read)))
+
+    def _sync(self):
+        """Sync any written data back to the raw io"""
+        if self._buff and self._dirty:
+            p = self.tell()
+
+            self.seek(self._buff_offset)
+            self._crypt.seek(self._buff_offset)
+            super().write(self._crypt.encrypt(self._buff))
+
+            self.seek(p)
+            self._dirty = False
+
+    def flush(self):
+        self._sync()
+        super().flush()
+
+    def close(self):
+        self._sync()
+        super().close()
+
+    def read(self, size=None):
+        if not self._crypt:
+            return super().read(size)
+
+        pos = self.tell()
+        if size is None:
+            size = self.size - pos
+
+        self._load_buffer(pos, size)
+
+        # Will raise an IO error if reading off the end of the stream
+        self.seek(pos + size)
+
+        offset = pos - self._buff_offset
+        return self._buff[offset : offset + size]
+
+    def write(self, b: bytes):
+        if not self._crypt:
+            return super().write(b)
+
+        size = len(b)
+
+        if not size:
+            return
+
+        pos = self.tell()
+
+        # TODO: Allow writing without having to preallocate a buffer
+        # TODO: optimization - if write is sector-aligned, don't read first
+        self._load_buffer(pos, size)
+
+        # Will raise an IO error if writing off the end of the stream
+        self.seek(pos + size)
+
+        offset = pos - self._buff_offset
+        self._buff[offset:offset+size] = b
+        self._dirty = True
+        return size
 
 
 # TODO: Find a better way to link headers+data
@@ -493,47 +610,25 @@ class NcaFsEntry(BaseIO):
         self.skip(0x8) # reserved
 
 
-class NcaHeader(BaseIO):
+class NcaHeader(EncryptedBaseIO):
 
     static_size = 0x400
 
-    # TODO: This won't work with immutable buffers - implement transparent decryption
-    def decrypt(self):
-        console_keys = ConsoleKeys(Path.home() / ".switch" / "prod.keys")
-        crypto = aes128.AESXTS(console_keys['header_key'])
-        encrypted = self.read()
-
-        #from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        #from cryptography.hazmat.backends import default_backend
-        #cipher = Cipher(
-        #    algorithms.AES(console_keys['header_key']),
-        #    modes.XTS(),
-        #    default_backend()
-        #)
-        #decryptor = cipher.decryptor()
-        #out = decryptor.update(encrypted) + decryptor.finalize()
-
-        decrypted = crypto.decrypt(encrypted)
-
-        #if not out == decrypted:
-        #    print(out)
-        #    print(decrypted)
-        #    assert False
-
-        self.seek(0)
-        self.write(decrypted)
-        self.seek(0)
+    def __init__(self, *args, header_key, **kwargs):
+        encryption = EncryptionScheme(
+            method=EncryptionType.AES_XTS,
+            key=header_key
+        )
+        super().__init__(*args, encryption=encryption, **kwargs)
 
     # TODO: unused?
     def has_title_rights(self):
         return self._rights_id != b"0"*32
 
     def parse(self):
-        self.decrypt() # TODO: do this in the BaseIO?
-
         self.signature1 = self.read(0x100)
         self.signature2 = self.read(0x100)
-        self.read_magic(b"NCA3") # TODO: support old versions
+        self.read_magic(b"NCA3") # TODO: support old versions?
         self.distribution_type = self.read_uint8() # enum 0x00 = System NCA, 0x01 = Gamecard NCA
         self.content_type = try_enum(ContentType, self.read_uint8())
         self.key_generation_old = try_enum(KeyGeneration, self.read_uint8())
@@ -550,14 +645,12 @@ class NcaHeader(BaseIO):
         self.sections = [self.parse_object(NcaFsEntry()) for _ in range(4)]
         self.header_sha256_hashes = [self.read(0x20) for x in self.sections]
 
-
-        console_keys = ConsoleKeys(Path.home() / ".switch" / "prod.keys")
         key_generation = try_enum(
             KeyGeneration, max(self.key_generation_old, self.key_generation_new)
         )
 
         encrypted_key_block = self.read(0x40)
-        key_block = console_keys.unwrap_title_key(encrypted_key_block, console_keys.master_key_index(key_generation))
+        key_block = self.console_keys.unwrap_title_key(encrypted_key_block, self.console_keys.master_key_index(key_generation))
         self.keys = [
             key_block[i * 0x10: (i+1) * 0x10]
             for i in range(4)
@@ -582,7 +675,9 @@ class NcaFsHeader(BaseIO):
 class Nca(BaseIO):
 
     def parse(self):
-        header = self.parse_object(NcaHeader())
+        header = self.parse_object(NcaHeader(header_key=self.console_keys['header_key']))
+        # TODO: In pre NCA3 the sector count is reset to 0 per header
+        #       In NCA3+ it's teleative to the start of the entire NCA
         # TODO: decrypt before continuing
         #for s in header.sections:
         #    self.parse_object(NcaFsHeader())
