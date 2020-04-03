@@ -13,6 +13,8 @@ from binascii import hexlify, unhexlify
 __log__ = logging.getLogger(__name__)
 
 
+########################################
+# Utils
 def try_enum(enum, val):
     try:
         return enum(val)
@@ -20,12 +22,17 @@ def try_enum(enum, val):
         __log__.warning("Unknown %s value of '%s'", enum, val)
         return val
 
+def is_power_of_2(num: int):
+    return num > 0 and (num & (num-1) == 0)
+
+
 ########################################
 # Types
 from enum import IntEnum
 
 MEDIA_UNITS = 0x200
-SECTOR_SIZE = 0x200
+XTS_SECTOR_SIZE = 0x200
+BUFFER_SIZE = 0x1000 # 4B
 
 class ContentType(IntEnum):
     PROGRAM = 0x0
@@ -58,13 +65,46 @@ class TicketSignatureType(IntEnum):
     RSA_2048_SHA256 = 0x010004
     ECDSA_SHA256 = 0x010005
 
+
+@dataclass
+class EncryptionScheme:
+    method: EncryptionType
+
+    # The key(s) to use.
+    # For XTS this is the block key + tweak key (128 bits/16 bytes each)
+    # For CBC it's a single key equal the the block size (128 bits/16 bytes)
+    key: bytes = None
+
+    # The sector size for XTS mode
+    sector_size: int = XTS_SECTOR_SIZE
+
+    # For XTS this is a sector number, for CBC it's a nonce/iv
+    iv: Union[int, bytes] = None
+
 #########################################
 
 
-class BaseIO:
+class UnbufferedBaseIO:
     """Base class of all IO-related classes
 
-    Creates BaseIO objects that act as views into the underlying data.
+    Supports creating "child" UnbufferedBaseIO objects that act as views into
+    certain ranges of the underlying data. Each of these children keeps track
+    of their own offset. This makes it easier to reason about their local data
+    structures.
+
+    When reading/writing data at an offset, the children apply their local
+    offset and defer up to the parent object on how to handle the IO. If there
+    is no parent, it's assumed to be the top-level object and the request is
+    passed to the loaded stream.
+
+    All read/write operations are done directly on the stream making it
+    unusable for dealing with encrypted objects.
+
+    The lack of buffering also means that unless the underlying stream is
+    buffered, doing many small reads/writes will kill performance.
+
+    The BaseIO subclass adds support for buffering and encryption and is
+    probably what you want to use.
     """
 
     # Subclasses that are staticly sized can define this instead of passing size to init
@@ -295,6 +335,7 @@ class BaseIO:
         # check) so only check when debugging.
         if __log__.isEnabledFor(logging.DEBUG):
             self._check_offset(target)
+
         return self._io.seek(self._offset + target, io.SEEK_SET)
 
     def skip(self, offset):
@@ -318,27 +359,7 @@ class BaseIO:
             self._io.flush()
 
 
-@dataclass
-class EncryptionScheme:
-    method: EncryptionType
-
-    # The key(s) to use.
-    # For XTS this is the block key + tweak key (128 bits/16 bytes each)
-    # For CBC it's a single key equal the the block size (128 bits/16 bytes)
-    key: bytes
-
-    # The sector size for XTS mode
-    sector_size: int = SECTOR_SIZE
-
-    # For XTS this is a sector number, for CBC it's a nonce/iv
-    iv: Union[int, bytes] = None
-
-
-def is_power_of_2(num: int):
-    return num > 0 and (num & (num-1) == 0)
-
-
-class EncryptedBaseIO(BaseIO):
+class BaseIO(UnbufferedBaseIO):
     """Transparently applies block-based encryption on read/write if required
 
     Pages data in and out of the buffer as it's requested
@@ -354,38 +375,46 @@ class EncryptedBaseIO(BaseIO):
         # Always load this amount of data into the buffer, regardless of what's requested.
         # Should be a multiple of the alignment (sector size for XTS, block size for CBC/CTR/ECB)
         # for best performance (keeps writes aligned in the buffer)
-        self.min_buffer_size = 0x1000 # 4KB
+        self.min_buffer_size = BUFFER_SIZE
 
         # Set up encryption
         # If encryption is None/invalid then all I/O operations are just passed through
         # to the superclass.
-        self._crypt = None
-        self._alignment = None
         self._setup_encryption(encryption)
 
     def _setup_encryption(self, encryption):
-        __log__.debug("Setting up encryption for %s: %s", self, encryption)
-        if not encryption:
-            self._crypt = None
 
+        if not encryption or encryption.method == EncryptionType.NONE:
+            self._crypt = None
+            self._alignment = 1
+            return
+
+        __log__.debug("Setting up encryption for %s: %s", self, encryption)
         if encryption.method == EncryptionType.AES_XTS:
             if not is_power_of_2(encryption.sector_size):
-                raise ValueError("Sector size must be a power of 2")
+                raise ValueError("Sector size must be a power of 2 for AES XTS")
 
-            self._alignment = encryption.sector_size
             self._crypt = aes128.AESXTS(
                 keys=encryption.key,
                 initial_sector=encryption.iv or 0,
-                sector_size=self._alignment
+                sector_size=encryption.sector_size
             )
-        elif encryption.method in (EncryptionType.CTR, EncryptionType.CTR_EX):
+            self._alignment = self._crypt.sector_size
+        elif encryption.method in (EncryptionType.AES_CTR, EncryptionType.AES_CTR_EX):
             # TODO: test
-            # Key size must be equal to block size
-            # (should always be 128 bits/16 bytes which the crypt init will check)
-            self._alignment = len(encryption.key)
+            # AES 128, therefore the key needs to be 16 bytes (128 bits)
+            lk = len(self._crypt.key)
+            if lk != 16:
+                raise ValueError(
+                    "Invalid key length for AES CTR (got {}, need 16)".format(lk)
+                )
+
             self._crypt = aes128.AESCTR(key=encryption.key, nonce=encryption.iv)
+            self._alignment = 16
         else:
-            self._crypt = None
+            raise NotImplementedError(
+                "Encryption method {} not implemented".format(encryption.method)
+            )
 
     def aligned(self, offset, upper=False):
         """Return the offset aligned to the lower/upper alignment boundry"""
@@ -439,22 +468,24 @@ class EncryptedBaseIO(BaseIO):
 
         self._buff_offset = new_buff_offset
         self.seek(self._buff_offset)
-        self._crypt.seek(self._buff_offset)
-        self._buff = bytearray(
-            self._crypt.decrypt(super().read(to_read, check_bounds=False))
-        )
+        self._buff = bytearray(super().read(to_read, check_bounds=False))
+        if self._crypt:
+            self._crypt.seek(self._buff_offset)
+            self._buff = bytearray(self._crypt.decrypt(self._buff))
 
     def _sync(self):
         """Sync any written data back to the raw io"""
         if self._buff and self._dirty:
             p = self.tell()
 
+            to_write = self._buff
+            if self._crypt:
+                self._crypt.seek(self._buff_offset)
+                to_write = self._crypt.encrypt(to_write)
+
+            # Bounds were already checked when adding data to the buffer
             self.seek(self._buff_offset)
-            self._crypt.seek(self._buff_offset)
-            super().write(
-                self._crypt.encrypt(self._buff),
-                check_bounds=False  # Bounds have already been checked
-            )
+            super().write(to_write, check_bounds=False)
 
             self.seek(p)
             self._dirty = False
@@ -468,9 +499,6 @@ class EncryptedBaseIO(BaseIO):
         super().close()
 
     def read(self, size=None, check_bounds=True):
-        if not self._crypt:
-            return super().read(size, check_bounds=check_bounds)
-
         pos = self.tell()
         if size is None:
             size = self.size - pos
@@ -485,17 +513,16 @@ class EncryptedBaseIO(BaseIO):
         return self._buff[offset : offset + size]
 
     def write(self, b: bytes, check_bounds=True):
-        if not self._crypt:
-            return super().write(b, check_bounds=check_bounds)
-
         size = len(b)
         if not size:
             return 0
 
         pos = self.tell()
 
-        # Optimization: If the write is aligned, don't bother reading the data
-        #               since it's all just going to be replaced
+        # Optimization:
+        # If the write is aligned, don't bother reading the data since it's all
+        # going to be replaced. This will always be the case when not using
+        # encryption because the alignment is set to 1, making any offset aligned
         if self.misalignment(pos) == 0 and self.misalignment(size) == 0:
             if check_bounds:
                 self._check_offset(pos, size)
@@ -682,7 +709,7 @@ class NcaFsEntry(BaseIO):
         self.skip(0x8) # reserved
 
 
-class NcaHeader(EncryptedBaseIO):
+class NcaHeader(BaseIO):
 
     static_size = 0x400
 
