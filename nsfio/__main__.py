@@ -4,9 +4,11 @@ import sys
 from nsfio import class_from_name
 
 from nsfio.keys import ConsoleKeys
+import logging
 
 
 def main():
+    logging.basicConfig(level=logging.DEBUG, format="[%(levelname)8s] %(message)s")
     console_keys = ConsoleKeys(Path.home() / ".switch" / "prod.keys")
 
     f = sys.argv[1]

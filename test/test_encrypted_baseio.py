@@ -42,7 +42,7 @@ class EBIO(EncryptedBaseIO):
 
         self.write(bytes([self.tell()]))
 
-        # Write = sector size,aligned
+        # Write = sector size, aligned
         self.write(bytes(range(self.tell(), self.tell() + self.alignment)))
 
         # Write > sector size

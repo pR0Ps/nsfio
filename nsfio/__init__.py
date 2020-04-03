@@ -179,20 +179,41 @@ class BaseIO:
     def __del__(self):
         self.close()
 
-    def _check_offset(self, target):
+    def _check_offset(self, target, size=0):
+        """Check the (relative) offset is valid"""
         # TODO: Test overhead of checking bounds on every read/write/seek
-        if not (self._offset <= target <= self._offset + self.size):
-            raise IOError("Offset {:#x} is out of range (0 - {:#x} @ {:#x})".format(target - self._offset, self.size, self._offset))
+        if not (0 <= target <= target + size <= self.size):
+            raise IOError("Offset {:#x} is out of range (0 - {:#x} @ {:#x})".format(target, self.size, self._offset))
 
     # Methods to interact with the underlying io object
-    # TODO: This should propagate up using self.parent.read()
-    def read(self, size=None):
+    def _read(self, size):
+        __log__.debug("Reading %s bytes from <stream>", size or "?")
+        return self._io.read(size)
+
+    def read(self, size=None, check_bounds=True):
+        """Read bytes from the object
+
+        Will call read on its parent object, or, if it's the top-level object,
+        will read directly from the loaded io stream.
+
+        If check_bounds is True (default) the write offset + size will be
+        checked to make sure it's within the object bounds. When calling write
+        on the parent object, this flag will always be disabled.
+        """
+        __log__.debug("Reading %s bytes from %s", size or "?", self.__class__.__qualname__)
         if size is None:
             size = self.size - self.tell()
-        else:
-            self._check_offset(self._io.tell() + size)
 
-        return self._io.read(size)
+        if size <= 0:
+            return b""
+
+        if check_bounds:
+            self._check_offset(self.tell(), size)
+
+        if self.parent:
+            return self.parent.read(size, check_bounds=False)
+        else:
+            return self._read(size)
 
     def read_uint(self, size):
         return int.from_bytes(self.read(size), byteorder="little", signed=False)
@@ -226,25 +247,48 @@ class BaseIO:
         """Peek at the next size bytes without advancing the position"""
         if not size:
             raise ValueError("Peek requires a size")
-        self.read(size)
-        self._io.seek(-size, io.SEEK_CURR)
+        try:
+            return self.read(size)
+        finally:
+            self._io.seek(-size, io.SEEK_CURR)
 
-    def write(self, b: bytes):
-        self._check_offset(self._io.tell() + len(b))
+    def _write(self, b: bytes):
+        __log__.debug("Writing %s bytes to <stream>", len(b))
         return self._io.write(b)
+
+    def write(self, b: bytes, check_bounds=True):
+        """Write bytes to the object
+
+        Will call write on its parent object, or, if it's the top-level object,
+        will write directly to the loaded io stream.
+
+        If check_bounds is True (default) the write offset + size will be
+        checked to make sure it's within the object bounds. When calling write
+        on the parent object, this flag will always be disabled.
+        """
+        size = len(b)
+        __log__.debug("Writing %s bytes to %s", size, self.__class__.__qualname__)
+        if check_bounds:
+            self._check_offset(self.tell(), size)
+
+        if self.parent:
+            return self.parent.write(b, check_bounds=False)
+        else:
+            return self._write(b)
 
     def seek(self, offset, whence=io.SEEK_SET):
         if whence == io.SEEK_SET:
-            target = self._offset + offset
+            target = offset
         elif whence == io.SEEK_CUR:
-            target = self._io.tell() + offset
+            target = self.tell() + offset
         elif whence == io.SEEK_END:
-            target = self._offset + self._size + offset
+            target = self.size + offset
         else:
             raise ValueError("Invalid whence ({}, should be 0, 1 or 2)".format(whence))
 
-        self._check_offset(target)
-        return self._io.seek(target, io.SEEK_SET)
+        if __log__.isEnabledFor(logging.DEBUG):
+            self._check_offset(target)
+        return self._io.seek(self._offset + target, io.SEEK_SET)
 
     def skip(self, offset):
         """Convenience function for seeking forwards"""
@@ -391,7 +435,7 @@ class EncryptedBaseIO(BaseIO):
 
             self.seek(self._buff_offset)
             self._crypt.seek(self._buff_offset)
-            super().write(self._crypt.encrypt(self._buff))
+            super().write(self._crypt.encrypt(self._buff), check_bounds=False)
 
             self.seek(p)
             self._dirty = False
@@ -404,13 +448,16 @@ class EncryptedBaseIO(BaseIO):
         self._sync()
         super().close()
 
-    def read(self, size=None):
+    def read(self, size=None, check_bounds=True):
         if not self._crypt:
-            return super().read(size)
+            return super().read(size, check_bounds=check_bounds)
 
         pos = self.tell()
         if size is None:
             size = self.size - pos
+
+        if size <= 0:
+            return b""
 
         self._load_buffer(pos, size)
 
@@ -420,12 +467,11 @@ class EncryptedBaseIO(BaseIO):
         offset = pos - self._buff_offset
         return self._buff[offset : offset + size]
 
-    def write(self, b: bytes):
+    def write(self, b: bytes, check_bounds=True):
         if not self._crypt:
-            return super().write(b)
+            return super().write(b, check_bounds=check_bounds)
 
         size = len(b)
-
         if not size:
             return
 
