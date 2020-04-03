@@ -1,8 +1,12 @@
 #!/usr/bin/env python
 
+import io
+
 from nsfio import EncryptedBaseIO, EncryptionScheme, EncryptionType
 from nsfio import aes128
-import io
+
+import pytest
+
 
 class EBIO(EncryptedBaseIO):
 
@@ -11,10 +15,10 @@ class EBIO(EncryptedBaseIO):
     def parse(self):
         # Only reading a single byte still pulls an entire sector in
         assert list(self.read(1)) == [self.tell() - 1]
-        assert len(self._buff) == self.alignment
+        assert len(self._buff) == self._alignment
 
         # Move to next sector - 1
-        self.skip(self.alignment - 1)
+        self.skip(self._alignment - 1)
 
         # test crossing sector boundry by reading
         o = self._buff_offset
@@ -32,21 +36,29 @@ class EBIO(EncryptedBaseIO):
         self.seek(0)
         self.all_data = self.read()
 
+        # Reading past the end of the file is an error
+        with pytest.raises(IOError):
+            self.read(1)
+
     def serialize(self):
         # Write < sector size
-        for x in range(self.alignment - 1):
+        for x in range(self._alignment - 1):
             self.write(bytes([x]))
 
         # Write = sector size, not aligned
-        self.write(bytes(range(self.tell(), self.tell() + self.alignment)))
+        self.write(bytes(range(self.tell(), self.tell() + self._alignment)))
 
         self.write(bytes([self.tell()]))
 
         # Write = sector size, aligned
-        self.write(bytes(range(self.tell(), self.tell() + self.alignment)))
+        self.write(bytes(range(self.tell(), self.tell() + self._alignment)))
 
         # Write > sector size
         self.write(bytes(range(self.tell(), self.size)))
+
+        # Writing past the end of the file is an error
+        with pytest.raises(IOError):
+            self.write(bytes([1]))
 
         assert self.tell() == self.size
 

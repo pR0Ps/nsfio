@@ -179,11 +179,13 @@ class BaseIO:
     def __del__(self):
         self.close()
 
-    def _check_offset(self, target, size=0):
+    def _check_offset(self, target, size=None):
         """Check the (relative) offset is valid"""
         # TODO: Test overhead of checking bounds on every read/write/seek
-        if not (0 <= target <= target + size <= self.size):
-            raise IOError("Offset {:#x} is out of range (0 - {:#x} @ {:#x})".format(target, self.size, self._offset))
+        if not size and not (0 <= target <= self.size):
+            raise IOError("Can't access {:#x} - out of valid range 0x0-{:#x} @ {:#x})".format(target, self.size, self._offset))
+        if size and not (0 <= target <= target + size <= self.size):
+            raise IOError("Can't access {:#x}-{:#x} - out of valid range 0x0-{:#x} @ {:#x})".format(target, target+size, self.size, self._offset))
 
     # Methods to interact with the underlying io object
     def _read(self, size):
@@ -267,6 +269,9 @@ class BaseIO:
         on the parent object, this flag will always be disabled.
         """
         size = len(b)
+        if not size:
+            return 0
+
         __log__.debug("Writing %s bytes to %s", size, self.__class__.__qualname__)
         if check_bounds:
             self._check_offset(self.tell(), size)
@@ -286,6 +291,8 @@ class BaseIO:
         else:
             raise ValueError("Invalid whence ({}, should be 0, 1 or 2)".format(whence))
 
+        # Don't actually care if we seek out of range (read/write will do the
+        # check) so only check when debugging.
         if __log__.isEnabledFor(logging.DEBUG):
             self._check_offset(target)
         return self._io.seek(self._offset + target, io.SEEK_SET)
@@ -356,10 +363,6 @@ class EncryptedBaseIO(BaseIO):
         self._alignment = None
         self._setup_encryption(encryption)
 
-    @property
-    def alignment(self):
-        return self._alignment
-
     def _setup_encryption(self, encryption):
         __log__.debug("Setting up encryption for %s: %s", self, encryption)
         if not encryption:
@@ -384,15 +387,15 @@ class EncryptedBaseIO(BaseIO):
         else:
             self._crypt = None
 
-    def sector_align(self, offset, upper=False):
-        """Align the offset to a sector"""
+    def aligned(self, offset, upper=False):
+        """Return the offset aligned to the lower/upper alignment boundry"""
         if upper:
-            offset += self.alignment - 1
-        return offset & ~(self.alignment-1)
+            offset += self._alignment - 1
+        return offset & ~(self._alignment-1)
 
-    def relative_offset(self, offset):
-        """The offset relative to its lower sector boundry"""
-        return offset & ~-self.alignment
+    def misalignment(self, offset):
+        """Return the offset relative to its lower alignment boundry"""
+        return offset & ~-self._alignment
 
     def _load_buffer(self, offset, size):
         """Load data into the buffer
@@ -403,30 +406,43 @@ class EncryptedBaseIO(BaseIO):
         # Check if already loaded
         if (
             self._buff and
-            self._buff_offset <= offset and
-            self._buff_offset + len(self._buff) >= offset + size
+            (
+                self._buff_offset <=
+                offset <=
+                offset + size <=
+                self._buff_offset + len(self._buff)
+            )
         ):
             return
+
+        # Future optimization: avoid re-reading and re-decrypting any overlapping sectors
 
         # Need to read something new into the buffer - sync the current one
         self._sync()
 
-        # Future optimization: avoid re-reading and re-decrypting any overlapping sectors
-
-        # Align the starting offset back, increase the size to compansate
+        # Align the starting offset back, increase the size to compensate
         # Align the amount requested with the upper sector boundry
-        self._buff_offset = self.sector_align(offset)
-        aligned_read = self.sector_align(
-            max(size + self.relative_offset(offset), self.min_buffer_size),
-            upper=True
+        new_buff_offset = self.aligned(offset)
+        required_size = self.aligned(size + self.misalignment(offset), upper=True)
+
+        # Ensure the required range to load into the buffer is valid
+        self._check_offset(new_buff_offset, required_size)
+
+        # Attempt to fill the buffer
+        # (required_size is valid so the result of this will never be smaller)
+        to_read = self.aligned(
+            min(
+                max(required_size, self.min_buffer_size),
+                self.size - new_buff_offset
+            )
         )
 
-        # Don't read past EOF
-        actual_read = min(aligned_read, self.size - self._buff_offset)
-
+        self._buff_offset = new_buff_offset
         self.seek(self._buff_offset)
         self._crypt.seek(self._buff_offset)
-        self._buff = bytearray(self._crypt.decrypt(super().read(actual_read)))
+        self._buff = bytearray(
+            self._crypt.decrypt(super().read(to_read, check_bounds=False))
+        )
 
     def _sync(self):
         """Sync any written data back to the raw io"""
@@ -435,7 +451,10 @@ class EncryptedBaseIO(BaseIO):
 
             self.seek(self._buff_offset)
             self._crypt.seek(self._buff_offset)
-            super().write(self._crypt.encrypt(self._buff), check_bounds=False)
+            super().write(
+                self._crypt.encrypt(self._buff),
+                check_bounds=False  # Bounds have already been checked
+            )
 
             self.seek(p)
             self._dirty = False
@@ -460,8 +479,6 @@ class EncryptedBaseIO(BaseIO):
             return b""
 
         self._load_buffer(pos, size)
-
-        # Will raise an IO error if reading off the end of the stream
         self.seek(pos + size)
 
         offset = pos - self._buff_offset
@@ -473,19 +490,28 @@ class EncryptedBaseIO(BaseIO):
 
         size = len(b)
         if not size:
-            return
+            return 0
 
         pos = self.tell()
 
-        # TODO: Allow writing without having to preallocate a buffer
-        # TODO: optimization - if write is sector-aligned, don't read first
-        self._load_buffer(pos, size)
+        # Optimization: If the write is aligned, don't bother reading the data
+        #               since it's all just going to be replaced
+        if self.misalignment(pos) == 0 and self.misalignment(size) == 0:
+            if check_bounds:
+                self._check_offset(pos, size)
 
-        # Will raise an IO error if writing off the end of the stream
+            self._sync()
+            self._buff_offset = self.aligned(pos)
+            self._buff = bytearray(b)
+        else:
+            # TODO: Allow writing without having to preallocate a buffer.
+            #       make _load_buffer pad \x00's ?
+            self._load_buffer(pos, size)
+
+            offset = pos - self._buff_offset
+            self._buff[offset:offset+size] = b
+
         self.seek(pos + size)
-
-        offset = pos - self._buff_offset
-        self._buff[offset:offset+size] = b
         self._dirty = True
         return size
 
