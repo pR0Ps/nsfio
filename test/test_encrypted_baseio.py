@@ -2,7 +2,7 @@
 
 import io
 
-from nsfio import BaseIO, EncryptionScheme, EncryptionType
+from nsfio import UnbufferedBaseIO, BaseIO, EncryptionScheme, EncryptionType
 from nsfio import aes128
 
 import pytest
@@ -23,7 +23,8 @@ def assert_range(func):
                 self.read(1)
             elif func.__name__ == "serialize":
                 self.write(bytes([1]))
-            assert False, "Wrong function decorated"
+            else:
+                assert False, "Wrong function decorated"
 
     return wrapper
 
@@ -32,6 +33,10 @@ class EncryptionTest(BaseIO):
     """Dumb class that needs to be serialized before parsing it..."""
 
     static_size=128
+
+    def __init__(self, *args, **kwargs):
+        # Read as little as possible to test the load/flush behaviour
+        super().__init__(*args, min_buffer_size=1, **kwargs)
 
     @assert_range
     def parse(self):
@@ -76,14 +81,6 @@ class EncryptionTest(BaseIO):
         self.write(bytes(range(self.tell(), self.size)))
 
 
-def make_cls(encryption):
-    cls = EncryptionTest(encryption=encryption)
-
-    # Read as little as possible so we can test the load/flush behaviour
-    cls.min_buffer_size = 1
-    return cls
-
-
 def test_buffering_encrypting_data():
 
     initial = b"\x00" * EncryptionTest.static_size
@@ -98,11 +95,11 @@ def test_buffering_encrypting_data():
     encrypted_write = aes128.AESXTS(keys=enc.key, sector_size=enc.sector_size).encrypt(to_write)
 
     data = io.BytesIO(initial)
-    with make_cls(enc).to_io(data) as write_obj:
+    with EncryptionTest(encryption=enc).to_io(data) as write_obj:
         assert data.getvalue() == encrypted_write
 
         # call parse to test decryption
-        with make_cls(enc).from_io(data) as read_obj:
+        with EncryptionTest(encryption=enc).from_io(data) as read_obj:
             assert read_obj.all_data == to_write
 
 def test_initial_sector_offset():
@@ -121,12 +118,12 @@ def test_initial_sector_offset():
     ).encrypt(to_write)
 
     data = io.BytesIO(initial)
-    with make_cls(enc).to_io(data) as write_obj:
+    with EncryptionTest(encryption=enc).to_io(data) as write_obj:
         ### TODO: sector size initial offset
         assert data.getvalue() == encrypted_write
 
         # call parse to test decryption
-        with make_cls(enc).from_io(data) as read_obj:
+        with EncryptionTest(encryption=enc).from_io(data) as read_obj:
             assert read_obj.all_data == to_write
 
 def test_buffering_unencrypted():
@@ -138,15 +135,80 @@ def test_buffering_unencrypted():
     )
 
     data = io.BytesIO(initial)
-    with make_cls(None).to_io(data) as write_obj:
+    # no encryptuon specified
+    with EncryptionTest().to_io(data) as write_obj:
         assert data.getvalue() == to_write
 
         # call parse to test decryption
-        with make_cls(enc).from_io(data) as read_obj:
+        # specify encryption type of NONE
+        with EncryptionTest(encryption=enc).from_io(data) as read_obj:
             assert read_obj.all_data == to_write
 
 
-def test_nested_classes():
+def test_unbuffered_nested_classes():
+
+    class BIO(UnbufferedBaseIO):
+
+        static_size=128
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.all = []
+
+        @assert_range
+        def parse(self):
+            for b in bytes(range(BIO.static_size)):
+                t = self.read(1)
+                assert len(t) == 1
+                assert t[0] == b
+                self.all.append(t)
+
+        @assert_range
+        def serialize(self):
+            for x in self.all:
+                self.write(x)
+
+    class BIO2(UnbufferedBaseIO):
+
+        static_size=BIO.static_size * 2
+
+        @assert_range
+        def parse(self):
+            self.o1 = self.parse_object(BIO())
+            self.o2 = self.parse_object(BIO())
+
+        @assert_range
+        def serialize(self):
+            self.o1.serialize()
+            self.o2.serialize()
+
+    class BIO4(UnbufferedBaseIO):
+
+        static_size=BIO2.static_size * 2
+
+        @assert_range
+        def parse(self):
+            self.o1 = self.parse_object(BIO2())
+            self.o2 = self.parse_object(BIO2())
+
+        @assert_range
+        def serialize(self):
+            self.o1.serialize()
+            self.o2.serialize()
+
+    initial = bytes(range(BIO4.static_size // 4)) * 4
+
+    data = io.BytesIO(initial)
+    # test parsing
+    with BIO4().from_io(data) as read_obj:
+
+        # test serialization
+        output = io.BytesIO(bytes(BIO4.static_size))
+        with read_obj.to_io(output) as write_obj:
+            assert output.getvalue() == initial
+
+
+def test_buffered_nested_classes():
 
     class BIO(BaseIO):
 
@@ -197,16 +259,156 @@ def test_nested_classes():
             self.o1.serialize()
             self.o2.serialize()
 
-    initial = bytes(range(BIO.static_size)) * 4
+    initial = bytes(range(BIO4.static_size // 4)) * 4
 
     data = io.BytesIO(initial)
     # test parsing
     with BIO4().from_io(data) as read_obj:
 
         # test serialization
-        output = io.BytesIO(bytes(BIO.static_size * 4))
+        output = io.BytesIO(bytes(BIO4.static_size))
         with read_obj.to_io(output) as write_obj:
             assert output.getvalue() == initial
+
+
+def test_load_buffer():
+
+    def assert_buff(offset, size):
+        assert obj._buff_offset == offset
+        assert len(obj._buff) == size
+
+    obj = BaseIO(size=10)
+    obj._io = io.BytesIO(bytes(range(10)))
+    obj.min_buffer_size=5
+    obj._alignment = 1
+
+    # Initial load
+    obj._load_buffer(3, 1)
+    assert_buff(3, 5)
+
+    # shift left
+    obj._load_buffer(0, 5)
+    assert_buff(0, 5)
+
+    # shift right
+    obj._load_buffer(3, 5)
+    assert_buff(3, 5)
+
+    # left and bigger
+    obj._load_buffer(1, 8)
+    assert_buff(1, 8)
+
+    # right and smaller
+    obj._load_buffer(9, 1)
+    assert_buff(5, 5)
+
+    # left and smaller
+    obj._load_buffer(1, 1)
+    assert_buff(1, 5)
+
+    # right and bigger
+    obj._load_buffer(2, 8)
+    assert_buff(2, 8)
+
+    # sof
+    obj._load_buffer(0, 1)
+    assert_buff(0, 5)
+
+    # eof
+    obj._load_buffer(10, 0)
+    assert_buff(5, 5)
+
+    # sof
+    obj._load_buffer(0, 1)
+    assert_buff(0, 5)
+
+    # eof
+    obj._load_buffer(9, 1)
+    assert_buff(5, 5)
+
+
+def test_serialize_to_empty_stream():
+    """Test that objects should be able to be serialized to an"""
+
+    class SimpleIO(UnbufferedBaseIO):
+
+        static_size = 128
+
+        def __init__(self, *args, **kwargs):
+            # Disable loading extra data into buffer
+            super().__init__(*args, min_buffer_size=1, **kwargs)
+
+        def parse(self):
+            self.a = self.read(1)
+            self.b = self.read(100)
+            self.c = self.read()
+
+        def serialize(self):
+            self.write(self.a)
+            self.write(self.b)
+            self.write(self.c)
+
+    class SimpleBufferedIO(BaseIO):
+
+        static_size = 128
+
+        def __init__(self, *args, **kwargs):
+            # Disable loading extra data into buffer
+            super().__init__(*args, min_buffer_size=1, **kwargs)
+
+            # Make sure the IO is not aligned
+            self._alignment = 16
+
+        def parse(self):
+            self.a = self.read(1)
+            self.b = self.read(100)
+            self.c = self.read()
+
+        def serialize(self):
+            self.write(self.a)
+            self.write(self.b)
+            self.write(self.c)
+
+    class SimpleEncryptedIO(BaseIO):
+
+        static_size = 128
+
+        def __init__(self, *args, **kwargs):
+            enc = EncryptionScheme(
+                method=EncryptionType.AES_XTS,
+                key=b'\xaa' * 0x20,
+                sector_size=0x10, # Make sure the I/O is not aligned to this
+            )
+            # Disable loading extra data into buffer
+            super().__init__(*args, min_buffer_size=1, encryption=enc, **kwargs)
+
+        def parse(self):
+            self.a = self.read(1)
+            self.b = self.read(100)
+            self.c = self.read()
+
+        def serialize(self):
+            self.seek(-len(self.c), io.SEEK_END)
+            self.write(self.c)
+            self.seek(0)
+            self.write(self.a)
+            self.write(self.b)
+
+    data = bytes(range(SimpleIO.static_size))
+    with SimpleIO().from_bytes(data) as read_obj:
+        out = io.BytesIO()
+        with read_obj.to_io(out):
+            assert out.getvalue() == data
+
+    with SimpleBufferedIO().from_bytes(data) as read_obj:
+        out = io.BytesIO()
+        with read_obj.to_io(out):
+            assert out.getvalue() == data
+
+    with SimpleEncryptedIO().from_bytes(data) as read_obj:
+        out = io.BytesIO()
+        with read_obj.to_io(out):
+            assert out.getvalue() == data
 
 
 if __name__ == "__main__":

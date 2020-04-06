@@ -89,8 +89,10 @@ class UnbufferedBaseIO:
 
     Supports creating "child" UnbufferedBaseIO objects that act as views into
     certain ranges of the underlying data. Each of these children keeps track
-    of their own offset. This makes it easier to reason about their local data
-    structures.
+    of their offset relative to their parent object. This makes it easier to
+    reason about their local data structures.
+
+    It also means that objects can be re-parented without having to be modified.
 
     When reading/writing data at an offset, the children apply their local
     offset and defer up to the parent object on how to handle the IO. If there
@@ -141,7 +143,7 @@ class UnbufferedBaseIO:
     def from_bytes(self, data: Union[bytes, bytearray]):
         return self.from_io(io.BytesIO(data))
 
-    #TODO: API?
+    #TODO: API? Instantiate from kwargs?
     def to_io(self, data: io.BufferedIOBase):
         self._io = data
         self._io.seek(0)
@@ -178,9 +180,6 @@ class UnbufferedBaseIO:
 
     def parse_object(self, instance, offset=None):
         """Parse an object from the bytestream"""
-        if self._io is None:
-            raise ValueError("No data loaded")
-
         if instance.size is None:
             raise ValueError("The size of the object to parse must be known")
 
@@ -189,8 +188,7 @@ class UnbufferedBaseIO:
 
         # Transfer attributes to the new object
         instance._parent = self
-        instance._io = self._io
-        instance._offset = self._offset + offset
+        instance._offset = offset
         instance._console_keys = self.console_keys
 
         self._children.append(instance)
@@ -228,10 +226,6 @@ class UnbufferedBaseIO:
             raise IOError("Can't access {:#x}-{:#x} - out of valid range 0x0-{:#x} @ {:#x})".format(target, target+size, self.size, self._offset))
 
     # Methods to interact with the underlying io object
-    def _read(self, size):
-        __log__.debug("Reading %s bytes from <stream>", size or "?")
-        return self._io.read(size)
-
     def read(self, size=None, check_bounds=True):
         """Read bytes from the object
 
@@ -242,9 +236,10 @@ class UnbufferedBaseIO:
         checked to make sure it's within the object bounds. When calling write
         on the parent object, this flag will always be disabled.
         """
-        __log__.debug("Reading %s bytes from %s", size or "?", self.__class__.__qualname__)
         if size is None:
             size = self.size - self.tell()
+
+        __log__.debug("Reading %s bytes from %s", size, self.__class__.__qualname__)
 
         if size <= 0:
             return b""
@@ -255,7 +250,8 @@ class UnbufferedBaseIO:
         if self.parent:
             return self.parent.read(size, check_bounds=False)
         else:
-            return self._read(size)
+            __log__.debug("Reading %s bytes from <stream>", size)
+            return self._io.read(size)
 
     def read_uint(self, size):
         return int.from_bytes(self.read(size), byteorder="little", signed=False)
@@ -275,15 +271,18 @@ class UnbufferedBaseIO:
     def read_uint128(self):
         return self.read_uint(16)
 
-    def read_magic(self, expected):
-        self.magic = self.read(len(expected))
-        if self.magic != expected:
-            raise ValueError("Invalid {}: magic at {:#x} is {} (expected {})".format(
-                self.__class__.__qualname__,
-                self.tell(),
-                self.magic,
-                expected
-            ))
+    def read_expected(self, expected):
+        val = self.read(len(expected))
+        if val != expected:
+            raise ValueError(
+                "Error parsing {}: Expected value at {:#x} was {} (expected {})".format(
+                    self.__class__.__qualname__,
+                    self.tell(),
+                    val,
+                    expected
+                )
+            )
+        return val
 
     def peek(self, size):
         """Peek at the next size bytes without advancing the position"""
@@ -292,11 +291,7 @@ class UnbufferedBaseIO:
         try:
             return self.read(size)
         finally:
-            self._io.seek(-size, io.SEEK_CURR)
-
-    def _write(self, b: bytes):
-        __log__.debug("Writing %s bytes to <stream>", len(b))
-        return self._io.write(b)
+            self.seek(-size, io.SEEK_CURR)
 
     def write(self, b: bytes, check_bounds=True):
         """Write bytes to the object
@@ -319,7 +314,8 @@ class UnbufferedBaseIO:
         if self.parent:
             return self.parent.write(b, check_bounds=False)
         else:
-            return self._write(b)
+            __log__.debug("Writing %s bytes to <stream>", len(b))
+            return self._io.write(b)
 
     def seek(self, offset, whence=io.SEEK_SET):
         if whence == io.SEEK_SET:
@@ -336,50 +332,74 @@ class UnbufferedBaseIO:
         if __log__.isEnabledFor(logging.DEBUG):
             self._check_offset(target)
 
-        return self._io.seek(self._offset + target, io.SEEK_SET)
+        if self.parent:
+            return self.parent.seek(self._offset + target, io.SEEK_SET)
+        else:
+            return self._io.seek(self._offset + target, io.SEEK_SET)
 
     def skip(self, offset):
         """Convenience function for seeking forwards"""
         self.seek(offset, io.SEEK_CUR)
 
     def tell(self):
-        return self._io.tell() - self._offset
-
-    def close(self):
-        if self._io:
-            self._io.close()
+        if self.parent:
+            return self.parent.tell() - self._offset
+        else:
+            return self._io.tell() - self._offset
 
     @property
     def closed(self):
-        if self._io:
-            self._io.closed
+        if self.parent:
+            return self.parent.closed
+        else:
+            return self._io.closed
+
+    def close(self):
+        if self.parent:
+            self.parent.close()
+        elif self._io and not self._io.closed:
+            self._io.close()
 
     def flush(self):
-        if self._io:
+        if self.parent:
+            self.parent.flush()
+        elif self._io:
             self._io.flush()
 
 
 class BaseIO(UnbufferedBaseIO):
-    """Transparently applies block-based encryption on read/write if required
+    """A subclasses of UnbufferedBaseIO that implements buffering and block-based encryption
 
-    Pages data in and out of the buffer as it's requested
+    Without encryption enabled will just buffer data to reduce I/O calls to the
+    underlying stream.
+
+    With encryption enabled will buffer data as well a as apply block-based
+    encryption when data is read from/written to the underlying stream.
     """
 
-    def __init__(self, *args, encryption: EncryptionScheme = None, **kwargs):
+    def __init__(self,
+        *args,
+        encryption: EncryptionScheme = None,
+        min_buffer_size=BUFFER_SIZE,
+        **kwargs
+    ):
+        """
+        Initialize the buffer and set up encryption (if any)
+
+        min_buffer_size: Always load this many bytes into the buffer, regardless
+                         of what was requested.
+                         When using encryption this should be a multiple of the alignment
+                         (sector size for XTS, block size for CBC/CTR/ECB) for best
+                         performance (keeps writes aligned in the buffer).
+        """
         super().__init__(*args, **kwargs)
 
         self._buff : bytearray = None # Data contained in the buffer
         self._buff_offset = None # The offset of the buffer (aligned to sector size)
         self._dirty = False # the buffer was modified and needs to be written back
 
-        # Always load this amount of data into the buffer, regardless of what's requested.
-        # Should be a multiple of the alignment (sector size for XTS, block size for CBC/CTR/ECB)
-        # for best performance (keeps writes aligned in the buffer)
-        self.min_buffer_size = BUFFER_SIZE
+        self.min_buffer_size = min_buffer_size
 
-        # Set up encryption
-        # If encryption is None/invalid then all I/O operations are just passed through
-        # to the superclass.
         self._setup_encryption(encryption)
 
     def _setup_encryption(self, encryption):
@@ -426,29 +446,19 @@ class BaseIO(UnbufferedBaseIO):
         """Return the offset relative to its lower alignment boundry"""
         return offset & ~-self._alignment
 
-    def _load_buffer(self, offset, size):
-        """Load data into the buffer
+    def _is_buffered(self, offset, size):
+        """Check if the current offset+size is already in the buffer"""
+        return self._buff and (
+            self._buff_offset <=
+            offset <=
+            offset + size <=
+            self._buff_offset + len(self._buff)
+        )
 
-        Will start at the first sector that contains the offset and go until
-        all the bytes requested by the size have been read.
+    def _calc_min_buffer(self, offset, size):
+        """Calculate the offset and minimum size of the buffer so it includes
+        size bytes at offset.
         """
-        # Check if already loaded
-        if (
-            self._buff and
-            (
-                self._buff_offset <=
-                offset <=
-                offset + size <=
-                self._buff_offset + len(self._buff)
-            )
-        ):
-            return
-
-        # Future optimization: avoid re-reading and re-decrypting any overlapping sectors
-
-        # Need to read something new into the buffer - sync the current one
-        self._sync()
-
         # Align the starting offset back, increase the size to compensate
         # Align the amount requested with the upper sector boundry
         new_buff_offset = self.aligned(offset)
@@ -457,24 +467,142 @@ class BaseIO(UnbufferedBaseIO):
         # Ensure the required range to load into the buffer is valid
         self._check_offset(new_buff_offset, required_size)
 
-        # Attempt to fill the buffer
-        # (required_size is valid so the result of this will never be smaller)
-        to_read = self.aligned(
+        return new_buff_offset, required_size
+
+    def _calc_buffer(self, offset, size):
+        """Calculate the offset and size of the buffer so it includes size
+        bytes at offset while attempting to load up to min_buffer_size bytes
+        """
+        new_buff_offset, new_buff_size = self._calc_min_buffer(offset, size)
+
+        # Attempt to fill the buffer until EOF
+        # (new_buff_size has been verified to be inside EOF so the result of
+        # this will never be smaller than it)
+        new_buff_size = self.aligned(
             min(
-                max(required_size, self.min_buffer_size),
+                max(new_buff_size, self.min_buffer_size),
                 self.size - new_buff_offset
             )
         )
+        # Use any remaining bytes to go left until SOF
+        read_prev = self.aligned(
+            min(
+                max(0, self.min_buffer_size - new_buff_size),
+                new_buff_offset
+            ),
+            upper=True
+        )
+        new_buff_offset -= read_prev
+        new_buff_size += read_prev
+        return new_buff_offset, new_buff_size
+
+    def _read(self, offset, size, zeropad=False):
+        """Read size bytes at offset and decrypt them
+
+        If zeropad is False, it's an error if not enough data could be read.
+        Otherwise the data will be padded with null bytes
+        """
+        self.seek(offset)
+        data = super().read(size, check_bounds=False)
+
+        missing = size - len(data)
+        if zeropad:
+            data += b'\x00' * missing
+        elif missing:
+            raise ValueError(
+                "Failed to read {} bytes at {:#x} (missing {})".format(
+                    size, offset, missing
+                )
+            )
+        if self._crypt:
+            self._crypt.seek(offset)
+            data = self._crypt.decrypt(data)
+        return data
+
+    def _load_buffer(self, offset, size, content=None):
+        """Load data into the buffer
+
+        Will start at the first sector that contains the offset and go until
+        all the bytes requested by the size have been read.
+
+        If content is supplied, it will be written into the buffer as if it
+        was read from the stream at the supplied offset. The length of content
+        is assumed to be <= size.
+        """
+        # Check if already loaded
+        if self._is_buffered(offset, size):
+            if content:
+                tmp = offset - self._buff_offset
+                self._buff[tmp : tmp + len(content)] = content
+            return
+
+        new_buff_offset, new_buff_size = self._calc_buffer(offset, size)
+
+        if not self._buff:
+            self._buff_offset = new_buff_offset
+            curr_buff_size = 0
+        else:
+            curr_buff_size = len(self._buff)
+
+        # Avoid re-reading and re-decrypting any overlapping sectors by
+        # calculating the overlap with the current buffer (if any)
+        new_buff_end = new_buff_offset + new_buff_size
+        curr_buff_end = self._buff_offset + curr_buff_size
+
+        overlap_start = max(self._buff_offset, new_buff_offset)
+        overlap_end = max(overlap_start, min(curr_buff_end, new_buff_end))
+        overlap_size = overlap_end - overlap_start
+
+        if overlap_size < curr_buff_size:
+            # dropping something out of the buffer - sync any changes
+            self._sync()
+
+        if overlap_size <= 0:
+            # No overlapping data - read an entirely new buffer
+            read_left = 0
+            read_right = new_buff_size
+            overlap_end = new_buff_offset
+        else:
+            read_left = overlap_start - new_buff_offset
+            read_right = new_buff_end - overlap_end
+
+        # Optimization:
+        # Figure out which blocks to exclude from reading if we're just going
+        # to overwrite them entirely with the content
+        #if content:
+        #    exclude_start = self.aligned(offset, upper=True)
+        #    exclude_end = self.aligned(offset + len(content))
+        #    exclude_size = exclude_end - exclude_start
+
+        # Need to pad the buffer with null bytes when writing so it stays aligned
+        # Ex:
+        # Want to write a single byte into a new 16-byte block. Reading the new
+        # block will return b'' since there's no data there yet. We need to pad
+        # that read out with null bytes so when the buffer is synced back to the
+        # stream it can write a full sector.
+        writing = bool(content)
+
+        new_buff = bytearray()
+        if read_left > 0:
+            new_buff.extend(self._read(overlap_start - read_left, read_left, zeropad=writing))
+
+        if overlap_size > 0:
+            tmp = overlap_start - self._buff_offset
+            new_buff.extend(self._buff[tmp : tmp + overlap_size])
+
+        if read_right > 0:
+            new_buff.extend(self._read(overlap_end, read_right, zeropad=writing))
+
+        # write the content
+        if writing:
+            tmp = offset - new_buff_offset
+            new_buff[tmp : tmp + len(content)] = content
 
         self._buff_offset = new_buff_offset
-        self.seek(self._buff_offset)
-        self._buff = bytearray(super().read(to_read, check_bounds=False))
-        if self._crypt:
-            self._crypt.seek(self._buff_offset)
-            self._buff = bytearray(self._crypt.decrypt(self._buff))
+        self._buff = new_buff
 
     def _sync(self):
-        """Sync any written data back to the raw io"""
+        """Sync any written data back to the underlying stream"""
         if self._buff and self._dirty:
             p = self.tell()
 
@@ -495,7 +623,8 @@ class BaseIO(UnbufferedBaseIO):
         super().flush()
 
     def close(self):
-        self._sync()
+        if not self.closed:
+            self._sync()
         super().close()
 
     def read(self, size=None, check_bounds=True):
@@ -507,36 +636,24 @@ class BaseIO(UnbufferedBaseIO):
             return b""
 
         self._load_buffer(pos, size)
+
+        # position the stream cursor after the "read"
         self.seek(pos + size)
 
         offset = pos - self._buff_offset
         return self._buff[offset : offset + size]
 
     def write(self, b: bytes, check_bounds=True):
+        """Will always check the bounds"""
         size = len(b)
         if not size:
             return 0
 
         pos = self.tell()
 
-        # Optimization:
-        # If the write is aligned, don't bother reading the data since it's all
-        # going to be replaced. This will always be the case when not using
-        # encryption because the alignment is set to 1, making any offset aligned
-        if self.misalignment(pos) == 0 and self.misalignment(size) == 0:
-            if check_bounds:
-                self._check_offset(pos, size)
-
-            self._sync()
-            self._buff_offset = self.aligned(pos)
-            self._buff = bytearray(b)
-        else:
-            # TODO: Allow writing without having to preallocate a buffer.
-            #       make _load_buffer pad \x00's ?
-            self._load_buffer(pos, size)
-
-            offset = pos - self._buff_offset
-            self._buff[offset:offset+size] = b
+        # Load buffer will load any required data into the buffer and replace
+        # the bytes at the correct offset with the data to write
+        self._load_buffer(pos, size, content=b)
 
         self.seek(pos + size)
         self._dirty = True
@@ -592,7 +709,7 @@ class Hfs0FileEntry(BaseIO):
 class Hfs0(Filesystem):
 
     def parse(self):
-        self.read_magic(b"HFS0")
+        self.magic = self.read_expected(b"HFS0")
         self.num_files = self.read_uint32()
         self.string_table_size = self.read_uint32()
         self.skip(0x4) # padding/reserved
@@ -649,7 +766,7 @@ class Xci(BaseIO):
 
     def parse(self):
         self.signature = self.read(0x100)
-        self.read_magic(b"HEAD")
+        self.magic = self.read_expected(b"HEAD")
         self.secure_offset = self.read_uint32()
         self.backup_offset = self.read_uint32()
         self.title_kek_index = self.read_uint8()
@@ -727,7 +844,7 @@ class NcaHeader(BaseIO):
     def parse(self):
         self.signature1 = self.read(0x100)
         self.signature2 = self.read(0x100)
-        self.read_magic(b"NCA3") # TODO: support old versions?
+        self.magic = self.read_expected(b"NCA3") # TODO: support old versions?
         self.distribution_type = self.read_uint8() # enum 0x00 = System NCA, 0x01 = Gamecard NCA
         self.content_type = try_enum(ContentType, self.read_uint8())
         self.key_generation_old = try_enum(KeyGeneration, self.read_uint8())
