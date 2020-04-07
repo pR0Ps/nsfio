@@ -174,13 +174,13 @@ def test_unbuffered_nested_classes():
 
         @assert_range
         def parse(self):
-            self.o1 = self.parse_object(BIO())
-            self.o2 = self.parse_object(BIO())
+            self.o1 = self.read_object(BIO())
+            self.o2 = self.read_object(BIO())
 
         @assert_range
         def serialize(self):
-            self.o1.serialize()
-            self.o2.serialize()
+            self.write_object(self.o1)
+            self.write_object(self.o2)
 
     class BIO4(UnbufferedBaseIO):
 
@@ -188,13 +188,13 @@ def test_unbuffered_nested_classes():
 
         @assert_range
         def parse(self):
-            self.o1 = self.parse_object(BIO2())
-            self.o2 = self.parse_object(BIO2())
+            self.o1 = self.read_object(BIO2())
+            self.o2 = self.read_object(BIO2())
 
         @assert_range
         def serialize(self):
-            self.o1.serialize()
-            self.o2.serialize()
+            self.write_object(self.o1)
+            self.write_object(self.o2)
 
     initial = bytes(range(BIO4.static_size // 4)) * 4
 
@@ -237,13 +237,13 @@ def test_buffered_nested_classes():
 
         @assert_range
         def parse(self):
-            self.o1 = self.parse_object(BIO())
-            self.o2 = self.parse_object(BIO())
+            self.o1 = self.read_object(BIO())
+            self.o2 = self.read_object(BIO())
 
         @assert_range
         def serialize(self):
-            self.o1.serialize()
-            self.o2.serialize()
+            self.write_object(self.o1)
+            self.write_object(self.o2)
 
     class BIO4(BaseIO):
 
@@ -251,13 +251,13 @@ def test_buffered_nested_classes():
 
         @assert_range
         def parse(self):
-            self.o1 = self.parse_object(BIO2())
-            self.o2 = self.parse_object(BIO2())
+            self.o1 = self.read_object(BIO2())
+            self.o2 = self.read_object(BIO2())
 
         @assert_range
         def serialize(self):
-            self.o1.serialize()
-            self.o2.serialize()
+            self.write_object(self.o1)
+            self.write_object(self.o2)
 
     initial = bytes(range(BIO4.static_size // 4)) * 4
 

@@ -32,7 +32,7 @@ from enum import IntEnum
 
 MEDIA_UNITS = 0x200
 XTS_SECTOR_SIZE = 0x200
-BUFFER_SIZE = 0x1000 # 4B
+BUFFER_SIZE = 0x1000 # 4KB
 
 class ContentType(IntEnum):
     PROGRAM = 0x0
@@ -170,34 +170,11 @@ class UnbufferedBaseIO:
     # Define how to parse/serialize
     def parse(self):
         """Parse information out of the loaded stream"""
-        __log__.error("Parsing not implemented for {} objects".format(self.__class__.__qualname__))
+        __log__.error("Parsing not implemented for %s", self)
 
     def serialize(self):
         """Using the stored data, write to the stream"""
-        raise NotImplementedError(
-            "Serialization not implemented for {} objects".format(self.__class__.qualname__)
-        )
-
-    def parse_object(self, instance, offset=None):
-        """Parse an object from the bytestream"""
-        if instance.size is None:
-            raise ValueError("The size of the object to parse must be known")
-
-        if offset is None:
-            offset = self.tell()
-
-        # Transfer attributes to the new object
-        instance._parent = self
-        instance._offset = offset
-        instance._console_keys = self.console_keys
-
-        self._children.append(instance)
-
-        instance.seek(0)
-        instance.parse()
-        instance.seek(0, io.SEEK_END)
-
-        return instance
+        __log__.error("Serialization not implemented for %s", self)
 
     def __enter__(self):
         return self
@@ -239,7 +216,7 @@ class UnbufferedBaseIO:
         if size is None:
             size = self.size - self.tell()
 
-        __log__.debug("Reading %s bytes from %s", size, self.__class__.__qualname__)
+        __log__.debug("Reading %s bytes from %s", size, self)
 
         if size <= 0:
             return b""
@@ -252,6 +229,29 @@ class UnbufferedBaseIO:
         else:
             __log__.debug("Reading %s bytes from <stream>", size)
             return self._io.read(size)
+
+    def read_object(self, obj: "UnbufferedBaseIO"):
+        """Read an object from the bytestream
+
+        Will also add the object to self._children so __iter__ will return it
+        """
+        if obj.size is None:
+            raise ValueError("The size of the object to read must be known")
+
+        offset = self.tell()
+        __log__.info("Reading a %s from %s at 0x%x", obj, self, offset)
+
+        # Transfer attributes to the new object
+        obj._parent = self
+        obj._offset = offset
+        obj._console_keys = self.console_keys
+
+        self._children.append(obj)
+
+        obj.parse()
+        obj.seek(0, io.SEEK_END)
+
+        return obj
 
     def read_uint(self, size):
         return int.from_bytes(self.read(size), byteorder="little", signed=False)
@@ -276,7 +276,7 @@ class UnbufferedBaseIO:
         if val != expected:
             raise ValueError(
                 "Error parsing {}: Expected value at {:#x} was {} (expected {})".format(
-                    self.__class__.__qualname__,
+                    self,
                     self.tell(),
                     val,
                     expected
@@ -307,7 +307,7 @@ class UnbufferedBaseIO:
         if not size:
             return 0
 
-        __log__.debug("Writing %s bytes to %s", size, self.__class__.__qualname__)
+        __log__.debug("Writing %s bytes to %s", size, self)
         if check_bounds:
             self._check_offset(self.tell(), size)
 
@@ -316,6 +316,14 @@ class UnbufferedBaseIO:
         else:
             __log__.debug("Writing %s bytes to <stream>", len(b))
             return self._io.write(b)
+
+    def write_object(self, obj: "UnbufferedBaseIO"):
+        """Write an object to the bytestream using its serialize function"""
+
+        __log__.debug("Writing %s to %s", obj, self)
+        obj.serialize()
+        obj.seek(0, io.SEEK_END)
+        return obj.size
 
     def seek(self, offset, whence=io.SEEK_SET):
         if whence == io.SEEK_SET:
@@ -566,6 +574,8 @@ class BaseIO(UnbufferedBaseIO):
             read_left = overlap_start - new_buff_offset
             read_right = new_buff_end - overlap_end
 
+        __log__.debug("Buffering %s bytes from %s", read_left + overlap_size + read_right, self)
+
         # Optimization:
         # Figure out which blocks to exclude from reading if we're just going
         # to overwrite them entirely with the content
@@ -606,6 +616,8 @@ class BaseIO(UnbufferedBaseIO):
         if self._buff and self._dirty:
             p = self.tell()
 
+            __log__.debug("Syncing %s bytes to %s", len(self._buff), self)
+
             to_write = self._buff
             if self._crypt:
                 self._crypt.seek(self._buff_offset)
@@ -635,6 +647,8 @@ class BaseIO(UnbufferedBaseIO):
         if size <= 0:
             return b""
 
+        __log__.debug("Buffered reading %s bytes from %s", size, self)
+
         self._load_buffer(pos, size)
 
         # position the stream cursor after the "read"
@@ -644,19 +658,31 @@ class BaseIO(UnbufferedBaseIO):
         return self._buff[offset : offset + size]
 
     def write(self, b: bytes, check_bounds=True):
-        """Will always check the bounds"""
+        """Will write the object the the buffer
+
+        Calls write on parent objects as well so they can update their own
+        buffers.
+        """
         size = len(b)
         if not size:
             return 0
+
+        __log__.debug("Buffering %s bytes to %s", size, self)
 
         pos = self.tell()
 
         # Load buffer will load any required data into the buffer and replace
         # the bytes at the correct offset with the data to write
         self._load_buffer(pos, size, content=b)
-
-        self.seek(pos + size)
         self._dirty = True
+
+        # Propagate the write up so parent objects change their buffers too
+        if self.parent:
+            self.parent.write(b, check_bounds=False)
+
+        # position the stream cursor after the "write"
+        self.seek(pos + size)
+
         return size
 
 
@@ -724,13 +750,14 @@ class Hfs0(Filesystem):
         self.seek(pos)
 
         for i in range(self.num_files):
-            f = self.parse_object(Hfs0FileEntry())
+            f = self.read_object(Hfs0FileEntry())
             self.files.append(File(f))
 
         for f in self:
             hdr = f.header
             cls = class_from_name(hdr.name)
-            f.data = self.parse_object(cls(size=hdr.file_size), offset=data_start + hdr.file_offset)
+            self.seek(data_start + hdr.file_offset)
+            f.data = self.read_object(cls(size=hdr.file_size))
 
 
 class Pfs0(Filesystem):
@@ -786,17 +813,18 @@ class Xci(BaseIO):
         self.t2_key_index = self.read_uint32()
         self.normal_area_end_address = self.read_uint32() # in MEDIA_UNITS
 
-        self.gamecard_info = self.parse_object(GameCardInfo())
-        self.gamecard_cert = self.parse_object(GameCardCert(), offset=0x7000)
+        self.gamecard_info = self.read_object(GameCardInfo())
+        self.seek(0x7000)
+        self.gamecard_cert = self.read_object(GameCardCert())
 
-        self.hfs0 = self.parse_object(
+        self.seek(self.hfs0_offset)
+        self.hfs0 = self.read_object(
             Hfs0(
                 header_size=self.hfs0_header_size,
                 header_hash=self.hfs0_header_hash,
                 initial_data_hash=self.hfs0_initial_data_hash,
                 size=self.size - self.hfs0_offset # EOF
-            ),
-            offset=self.hfs0_offset
+            )
         )
 
 
@@ -858,7 +886,7 @@ class NcaHeader(BaseIO):
         self.skip(0xE) # reserved
         self.rights_id = hexlify(self.read(0x10)).upper()
 
-        self.sections = [self.parse_object(NcaFsEntry()) for _ in range(4)]
+        self.sections = [self.read_object(NcaFsEntry()) for _ in range(4)]
         self.header_sha256_hashes = [self.read(0x20) for x in self.sections]
 
         key_generation = try_enum(
@@ -891,12 +919,12 @@ class NcaFsHeader(BaseIO):
 class Nca(BaseIO):
 
     def parse(self):
-        header = self.parse_object(NcaHeader(header_key=self.console_keys['header_key']))
+        header = self.read_object(NcaHeader(header_key=self.console_keys['header_key']))
         # TODO: In pre NCA3 the sector count is reset to 0 per header
         #       In NCA3+ it's teleative to the start of the entire NCA
         # TODO: decrypt before continuing
         #for s in header.sections:
-        #    self.parse_object(NcaFsHeader())
+        #    self.read_object(NcaFsHeader())
 
 class Cnmt(BaseIO):
     pass
