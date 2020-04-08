@@ -2,7 +2,7 @@
 
 import io
 
-from nsfio import UnbufferedBaseIO, BaseIO, EncryptionScheme, EncryptionType
+from nsfio import UnbufferedBaseIO, BaseIO, EncryptionScheme, EncryptionType, display_bytes
 from nsfio import aes128
 
 import pytest
@@ -409,6 +409,15 @@ def test_serialize_to_empty_stream():
         out = io.BytesIO()
         with read_obj.to_io(out):
             assert out.getvalue() == data
+
+def test_human_size():
+    assert display_bytes(1) == "1 B"
+    assert display_bytes(10) == "10 B"
+    assert display_bytes(1023) == "1023 B"
+    assert display_bytes(1024) == "1 KiB"
+    assert display_bytes(1024*1024) == "1 MiB"
+    assert display_bytes(1024*1024 + 1024) == "1.001 MiB"
+    assert display_bytes(1024**10).endswith(" TiB")
 
 
 if __name__ == "__main__":

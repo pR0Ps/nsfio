@@ -26,6 +26,16 @@ def is_power_of_2(num: int):
     return num > 0 and (num & (num-1) == 0)
 
 
+SIZE_SUFFIXES = ('B', 'KiB', 'MiB', 'GiB', 'TiB')
+
+def display_bytes(size):
+    exp = min(
+        (int.bit_length(abs(size)) - 1) // 10,
+        len(SIZE_SUFFIXES) - 1
+    ) if size != 0 else 0
+    return '{:.4g} {}'.format(size / (1 << (exp * 10)), SIZE_SUFFIXES[exp])
+
+
 ########################################
 # Types
 from enum import IntEnum
@@ -186,7 +196,7 @@ class UnbufferedBaseIO:
         return self.size
 
     def __repr__(self):
-        return "<{} size={:#x}>".format(self.__class__.__qualname__, self.size)
+        return "<{} size='{}', offset={:#x}>".format(self.__class__.__qualname__, display_bytes(self.size), self._offset)
 
     def __iter__(self):
         return iter(self._children)
@@ -216,7 +226,11 @@ class UnbufferedBaseIO:
         if size is None:
             size = self.size - self.tell()
 
-        __log__.debug("Reading %s bytes from %s", size, self)
+        # Only log this out if debug is enabled and its not the super() call
+        # from a buffered read
+        if __log__.isEnabledFor(logging.DEBUG):
+            if not isinstance(self, BaseIO):
+                __log__.debug("       Reading: %5d bytes from %s", size, self)
 
         if size <= 0:
             return b""
@@ -227,7 +241,7 @@ class UnbufferedBaseIO:
         if self.parent:
             return self.parent.read(size, check_bounds=False)
         else:
-            __log__.debug("Reading %s bytes from <stream>", size)
+            __log__.debug("       Reading: %5d bytes from <stream>", size)
             return self._io.read(size)
 
     def read_object(self, obj: "UnbufferedBaseIO"):
@@ -239,12 +253,13 @@ class UnbufferedBaseIO:
             raise ValueError("The size of the object to read must be known")
 
         offset = self.tell()
-        __log__.info("Reading a %s from %s at 0x%x", obj, self, offset)
 
         # Transfer attributes to the new object
         obj._parent = self
         obj._offset = offset
         obj._console_keys = self.console_keys
+
+        __log__.debug("Reading %s from %s", obj, self)
 
         self._children.append(obj)
 
@@ -307,14 +322,19 @@ class UnbufferedBaseIO:
         if not size:
             return 0
 
-        __log__.debug("Writing %s bytes to %s", size, self)
+        # Only log this out if debug is enabled and its not the super() call
+        # from a buffer sync
+        if __log__.isEnabledFor(logging.DEBUG):
+            if not isinstance(self, BaseIO):
+                __log__.debug("       Writing: %5d bytes to %s", size, self)
+
         if check_bounds:
             self._check_offset(self.tell(), size)
 
         if self.parent:
             return self.parent.write(b, check_bounds=False)
         else:
-            __log__.debug("Writing %s bytes to <stream>", len(b))
+            __log__.debug("       Writing: %5d bytes to <stream>", len(b))
             return self._io.write(b)
 
     def write_object(self, obj: "UnbufferedBaseIO"):
@@ -574,7 +594,7 @@ class BaseIO(UnbufferedBaseIO):
             read_left = overlap_start - new_buff_offset
             read_right = new_buff_end - overlap_end
 
-        __log__.debug("Buffering %s bytes from %s", read_left + overlap_size + read_right, self)
+        __log__.debug("     Buffering: %5d bytes from %s", read_left + overlap_size + read_right, self)
 
         # Optimization:
         # Figure out which blocks to exclude from reading if we're just going
@@ -616,7 +636,7 @@ class BaseIO(UnbufferedBaseIO):
         if self._buff and self._dirty:
             p = self.tell()
 
-            __log__.debug("Syncing %s bytes to %s", len(self._buff), self)
+            __log__.debug(" Write buffer: %5d bytes to %s", len(self._buff), self)
 
             to_write = self._buff
             if self._crypt:
@@ -647,7 +667,7 @@ class BaseIO(UnbufferedBaseIO):
         if size <= 0:
             return b""
 
-        __log__.debug("Buffered reading %s bytes from %s", size, self)
+        __log__.debug(" Buffered read: %5d bytes from %s", size, self)
 
         self._load_buffer(pos, size)
 
@@ -667,7 +687,7 @@ class BaseIO(UnbufferedBaseIO):
         if not size:
             return 0
 
-        __log__.debug("Buffering %s bytes to %s", size, self)
+        __log__.debug("Buffered write: %5d bytes to %s", size, self)
 
         pos = self.tell()
 
