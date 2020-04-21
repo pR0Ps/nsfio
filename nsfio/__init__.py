@@ -818,12 +818,6 @@ class BaseIO(UnbufferedBaseIO):
         return size
 
 
-# TODO: Find a better way to link headers+data
-@dataclass
-class File:
-    header: BaseIO
-    data: BaseIO = None
-
 
 class Filesystem(BaseIO):
     """Contains other objects"""
@@ -866,6 +860,12 @@ class Pfs0FileEntry(BaseIO):
         self.name = self.parent.string_table[self.name_offset:].split(b"\0", 1)[0].decode("utf-8")
 
 
+@dataclass
+class FilesystemEntryData:
+    header: Union[Hfs0FileEntry, Pfs0FileEntry]
+    data: BaseIO = None
+
+
 class _xfs0Filesystem(Filesystem):
     """Adapater for Pfs0 and Hfs0 filesytems"""
 
@@ -904,9 +904,13 @@ class _xfs0Filesystem(Filesystem):
         data_start = self.tell()
         self.seek(pos)
 
+        self.files = []
         for _ in range(self.num_files):
-            f = self.read_object(self._file_entry_cls())
-            self.files.append(File(f))
+            self.files.append(
+                FilesystemEntryData(
+                    header=self.read_object(self._file_entry_cls())
+                )
+            )
 
         self._parse_files(data_start)
 
@@ -1283,47 +1287,60 @@ class NcaSection(BaseIO):
         )
 
 
+@dataclass
+class NcaSectionData:
+    location: NcaFsEntry
+    header: NcaFsHeader = None
+    section: NcaSection = None
+
+
 class Nca(BaseIO):
 
+    def __init__(self, *args, **kwargs):
+        self.sections = []
+        super().__init__(*args, **kwargs)
+
     def parse(self):
-        header = self.read_object(
-                NcaHeader(
-                    header_key=self.console_keys['header_key']
-                )
+        self.header = self.read_object(
+            NcaHeader(
+                header_key=self.console_keys['header_key']
+            )
         )
-        self.filesystem_headers = []
-        for s in header.sections:
-            if s.is_padding:
+        self.sections = [
+            NcaSectionData(location=x) for x in self.header.sections
+        ]
+
+        # Parse filesystem headers
+        for s in self:
+            if s.location.is_padding:
                 self.skip(NcaFsHeader.static_size)
-                self.filesystem_headers.append(None)
             else:
-                self.filesystem_headers.append(
-                    self.read_object(
-                        # TODO: In pre NCA3 the sector count is reset to 0 per header
-                        #       In NCA3+ it's relative to the start of the entire NCA
-                        NcaFsHeader(
-                            header_key=self.console_keys['header_key'],
-                            encryption_offset=self.tell()
-                        )
-                    )
-                )
-
-        self.filesystems = []
-        for section_hdr, fs_hdr in zip(header.sections, self.filesystem_headers):
-            if fs_hdr is None:
-                continue
-
-            self.seek(section_hdr.start_offset)
-            self.filesystems.append(
-                self.read_object(
-                    NcaSection(
-                        size=section_hdr.fs_size,
-                        fs_header=fs_hdr,
-                        nca_header=header,
+                s.header = self.read_object(
+                    # TODO: In pre NCA3 the sector count is reset to 0 per header
+                    #       In NCA3+ it's relative to the start of the entire NCA
+                    NcaFsHeader(
+                        header_key=self.console_keys['header_key'],
                         encryption_offset=self.tell()
                     )
                 )
+
+        # Parse filesystems
+        for s in self:
+            if s.location.is_padding:
+                continue
+
+            self.seek(s.location.start_offset)
+            s.section = self.read_object(
+                NcaSection(
+                    size=s.location.fs_size,
+                    fs_header=s.header,
+                    nca_header=self.header,
+                    encryption_offset=self.tell()
+                )
             )
+
+    def __iter__(self):
+        return iter(self.sections)
 
 
 class CnmtContentMetaInfo(BaseIO):
@@ -1409,25 +1426,12 @@ class Ticket(BaseIO):
 
     @property
     def title_key(self):
-        if self.title_key_type != 0:
-            return None
-        return self.title_key_block[:0x10]
-        return hexlify(self.title_key_block[:0x10]).decode("utf-8").upper()
+        if self.title_key_type == 0:
+            return self.title_key_block[:0x10]
+        return None
 
 
 class Nacp(BaseIO):
-    pass
-
-
-class Struct:
-    """A small unit of data"""
-
-
-class GamecardInfo(Struct):
-    pass
-
-
-class GamecardCertificate(Struct):
     pass
 
 
