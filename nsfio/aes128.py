@@ -20,9 +20,10 @@ def sxor(s1, s2):
 class AESCTR:
     """Class for performing AES CTR cipher operations."""
 
-    def __init__(self, key, nonce):
+    def __init__(self, key: bytes, nonce: bytes, *, initial_offset=0):
         self.key = key
         self.nonce = nonce
+        self._offset = initial_offset
         if len(nonce) != 0x10:
             raise ValueError("Nonce must be of size {:#x}".format(0x10))
         self.seek(0)
@@ -41,7 +42,7 @@ class AESCTR:
         return self.encrypt(data, ctr)
 
     def seek(self, offset):
-        self.ctr = Counter.new(64, prefix=self.nonce[0:8], initial_value=(offset >> 4))
+        self.ctr = Counter.new(64, prefix=self.nonce[0:8], initial_value=(offset + self._offset) >> 4)
         self.aes = AES.new(self.key, AES.MODE_CTR, counter=self.ctr)
 
     def bktrPrefix(self, ctr_val):
@@ -49,6 +50,7 @@ class AESCTR:
 
     def bktrSeek(self, offset, ctr_val, virtualOffset=0):
         offset += virtualOffset
+        offset += self._offset
         self.ctr = Counter.new(64, prefix=self.bktrPrefix(ctr_val), initial_value=(offset >> 4))
         self.aes = AES.new(self.key, AES.MODE_CTR, counter=self.ctr)
 
@@ -57,10 +59,10 @@ class AESCTR:
 class AESXTS:
     """Class for performing AES XTS cipher operations"""
 
-    def __init__(self, keys: bytes, initial_sector=0, sector_size=0x200):
-        self._initial_sector = initial_sector
-        self.sector_size = sector_size
-        self.set_sector(0)
+    def __init__(self, keys: bytes, sector_size: int, initial_offset=0):
+        self._initial_offset = initial_offset
+        self._sector_size = sector_size
+        self.seek(0)
 
         self.block_key = AESECB(keys[:16])
         self.tweak_key = AESECB(keys[16:])
@@ -77,8 +79,8 @@ class AESXTS:
         out = b""
         while data:
             tweak = self.get_tweak(self.sector)
-            out += self.encrypt_sector(data[: self.sector_size], tweak)
-            data = data[self.sector_size :]
+            out += self.encrypt_sector(data[: self._sector_size], tweak)
+            data = data[self._sector_size :]
             self.sector += 1
         return out
 
@@ -107,8 +109,8 @@ class AESXTS:
         out = b""
         while data:
             tweak = self.get_tweak(self.sector)
-            out += self.decrypt_sector(data[: self.sector_size], tweak)
-            data = data[self.sector_size :]
+            out += self.decrypt_sector(data[: self._sector_size], tweak)
+            data = data[self._sector_size :]
             self.sector += 1
         return out
 
@@ -142,14 +144,7 @@ class AESXTS:
 
         (will be set relative to the initial sector)
         """
-        self.set_sector(offset // self.sector_size)
-
-    def set_sector(self, sector):
-        """Set the sector
-
-        (will be set relative to the initial sector)
-        """
-        self.sector = self._initial_sector + sector
+        self.sector = (self._initial_offset + offset) // self._sector_size
 
 
 class AESECB:

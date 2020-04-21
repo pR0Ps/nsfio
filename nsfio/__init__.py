@@ -15,12 +15,6 @@ __log__ = logging.getLogger(__name__)
 
 ########################################
 # Utils
-def try_enum(enum, val):
-    try:
-        return enum(val)
-    except ValueError:
-        __log__.warning("Unknown %s value of '%s'", enum, val)
-        return val
 
 def is_power_of_2(num: int):
     return num > 0 and (num & (num-1) == 0)
@@ -44,7 +38,7 @@ MEDIA_UNITS = 0x200
 XTS_SECTOR_SIZE = 0x200
 BUFFER_SIZE = 0x1000 # 4KB
 
-class ContentType(IntEnum):
+class NcaContentType(IntEnum):
     PROGRAM = 0x0
     META = 0x1
     CONTROL = 0x2
@@ -52,12 +46,35 @@ class ContentType(IntEnum):
     DATA = 0x4  # DeltaFragment
     PUBLICDATA = 0x5
 
+class CnmtContentType(IntEnum):
+    META = 0x0
+    PROGRAM = 0x1
+    DATA = 0x2
+    CONTROL = 0x3
+    HTML_DOCUMENT = 0x4
+    LEGAL_INFO = 0x5
+    DELTA_FRAGMENT = 0x6
+
+class ContentMetaType(IntEnum):
+    UNKNOWN = 0x00
+    SYSTEM_PROGRAM = 0x01
+    SYSTEM_DATA = 0x02
+    SYSTEM_UPDATE = 0x03
+    BOOT_IMAGE_PACKAGE = 0x04
+    BOOT_IMAGE_PACKAGE_SAFE = 0x05
+    APPLICATION = 0x80
+    PATCH = 0x81
+    ADDON_CONTENT = 0x82
+    DELTA = 0x83
 
 class FsType(IntEnum):
-    NONE = 0x0
-    PFS0 = 0x2
-    ROMFS = 0x3
+    ROMFS = 0x0
+    PFS0 = 0x1
 
+class HashType(IntEnum):
+    AUTO = 0x0
+    H_SHA_256 = 0x2
+    H_INTEGRITY = 0x3
 
 class EncryptionType(IntEnum):
     AUTO = 0
@@ -75,6 +92,15 @@ class TicketSignatureType(IntEnum):
     RSA_2048_SHA256 = 0x010004
     ECDSA_SHA256 = 0x010005
 
+TICKET_SIGNATURE_SIZES = {
+    TicketSignatureType.RSA_4096_SHA1: 0x200,
+    TicketSignatureType.RSA_2048_SHA1: 0x100,
+    TicketSignatureType.ECDSA_SHA1: 0x3C,
+    TicketSignatureType.RSA_4096_SHA256: 0x200,
+    TicketSignatureType.RSA_2048_SHA256: 0x100,
+    TicketSignatureType.ECDSA_SHA256: 0x3C
+}
+
 
 @dataclass
 class EncryptionScheme:
@@ -85,11 +111,14 @@ class EncryptionScheme:
     # For CBC it's a single key equal the the block size (128 bits/16 bytes)
     key: bytes = None
 
+    # Initial offset into the encrypted data
+    initial_offset: int = 0
+
     # The sector size for XTS mode
     sector_size: int = XTS_SECTOR_SIZE
 
-    # For XTS this is a sector number, for CBC it's a nonce/iv
-    iv: Union[int, bytes] = None
+    # The nonce for CBC mode
+    nonce: Union[int, bytes] = None
 
 #########################################
 
@@ -118,6 +147,8 @@ class UnbufferedBaseIO:
     The BaseIO subclass adds support for buffering and encryption and is
     probably what you want to use.
     """
+
+    # TODO: __slots__ ?
 
     # Subclasses that are staticly sized can define this instead of passing size to init
     static_size = None
@@ -169,6 +200,11 @@ class UnbufferedBaseIO:
     def size(self):
         return self._size
 
+    def __bool__(self):
+        # Ensure the `if self.parent` checks return true even if the parent is
+        # 0 bytes
+        return True
+
     @property
     def console_keys(self):
         return self._console_keys
@@ -196,13 +232,19 @@ class UnbufferedBaseIO:
         return self.size
 
     def __repr__(self):
-        return "<{} size='{}', offset={:#x}>".format(self.__class__.__qualname__, display_bytes(self.size), self._offset)
+        return "<{}{}{}>".format(
+            self.__class__.__qualname__,
+            " size='{}'".format(display_bytes(self.size)) if hasattr(self, "_size") else "",
+            " offset='{:#x}'".format(self._offset) if hasattr(self, "_offset") else ""
+        )
 
     def __iter__(self):
         return iter(self._children)
 
     def __del__(self):
-        self.close()
+        # Don't close objects that haven't been initialized
+        if hasattr(self, "_io") and hasattr(self, "_parent"):
+            self.close()
 
     def _check_offset(self, target, size=None):
         """Check the (relative) offset is valid"""
@@ -268,6 +310,24 @@ class UnbufferedBaseIO:
 
         return obj
 
+    def read_string(self, size, null_terminated=True, encoding="utf-8"):
+        data = self.read(size)
+        if not null_terminated:
+            return data.decode(encoding)
+        return data.split(b'\x00', 1)[0].decode(encoding)
+
+    def read_hex(self, size, reverse=False):
+        data = self.read(size)
+        if reverse:
+            data = data[::-1]
+        return hexlify(data).decode("utf-8").upper()
+
+    def read_int(self, size):
+        return int.from_bytes(self.read(size), byteorder="little", signed=True)
+
+    def read_int32(self):
+        return self.read_int(4)
+
     def read_uint(self, size):
         return int.from_bytes(self.read(size), byteorder="little", signed=False)
 
@@ -299,14 +359,35 @@ class UnbufferedBaseIO:
             )
         return val
 
-    def peek(self, size):
+    def read_enum(self, size, enum, strict=True):
+        """Read size bytes and attempt to upconvert it into an enum
+
+        When strict=True (default) an exception will be raised if the value
+        is not a member of the enum.
+        """
+        if issubclass(enum, int):
+            val = self.read_uint(size)
+        else:
+            val = self.read(size)
+        try:
+            return enum(val)
+        except ValueError:
+            if strict:
+                raise
+            __log__.warning("Unknown %s value of '%s'", enum, val)
+            return val
+
+    def peek(self, size=None):
         """Peek at the next size bytes without advancing the position"""
-        if not size:
-            raise ValueError("Peek requires a size")
+        if size is None:
+            size = self.size - self.tell()
+        elif size == 0:
+            return b""
+
         try:
             return self.read(size)
         finally:
-            self.seek(-size, io.SEEK_CURR)
+            self.seek(-size, io.SEEK_CUR)
 
     def write(self, b: bytes, check_bounds=True):
         """Write bytes to the object
@@ -369,18 +450,24 @@ class UnbufferedBaseIO:
         """Convenience function for seeking forwards"""
         self.seek(offset, io.SEEK_CUR)
 
-    def tell(self):
+    def tell(self, absolute=False):
         if self.parent:
-            return self.parent.tell() - self._offset
+            p = self.parent.tell(absolute=absolute)
         else:
-            return self._io.tell() - self._offset
+            p = self._io.tell()
+
+        if not absolute:
+            p -= self._offset
+        return p
 
     @property
     def closed(self):
         if self.parent:
             return self.parent.closed
-        else:
+        elif self._io:
             return self._io.closed
+        else:
+            return True
 
     def close(self):
         if self.parent:
@@ -444,35 +531,60 @@ class BaseIO(UnbufferedBaseIO):
 
             self._crypt = aes128.AESXTS(
                 keys=encryption.key,
-                initial_sector=encryption.iv or 0,
-                sector_size=encryption.sector_size
+                sector_size=encryption.sector_size,
+                initial_offset=encryption.initial_offset or 0
             )
-            self._alignment = self._crypt.sector_size
+            self._alignment = encryption.sector_size
         elif encryption.method in (EncryptionType.AES_CTR, EncryptionType.AES_CTR_EX):
-            # TODO: test
             # AES 128, therefore the key needs to be 16 bytes (128 bits)
-            lk = len(self._crypt.key)
+            lk = len(encryption.key)
             if lk != 16:
                 raise ValueError(
                     "Invalid key length for AES CTR (got {}, need 16)".format(lk)
                 )
 
-            self._crypt = aes128.AESCTR(key=encryption.key, nonce=encryption.iv)
+            self._crypt = aes128.AESCTR(
+                key=encryption.key,
+                nonce=encryption.nonce,
+                initial_offset=encryption.initial_offset or 0
+            )
             self._alignment = 16
         else:
             raise NotImplementedError(
                 "Encryption method {} not implemented".format(encryption.method)
             )
 
-    def aligned(self, offset, upper=False):
-        """Return the offset aligned to the lower/upper alignment boundry"""
-        if upper:
-            offset += self._alignment - 1
-        return offset & ~(self._alignment-1)
+    def aligned(self, offset, *, upper=False, alignment=None):
+        """Return the offset aligned to the lower/upper alignment boundry
 
-    def misalignment(self, offset):
-        """Return the offset relative to its lower alignment boundry"""
-        return offset & ~-self._alignment
+        If alignment is not provided, the current object's block alignment will
+        be used (1 when no encryption is used, 16 for CTR, the sector size for XTS)
+
+        If upper is False (default), the offset will be aligned to the start of
+        the current aligned block (floor). If True, it will be aligned to the
+        start of the next aligned block (ceil)
+        """
+        if alignment is None:
+            alignment = self._alignment
+        elif not is_power_of_2(alignment):
+            raise ValueError("Alignment must be a power of 2")
+
+        if upper:
+            offset += alignment - 1
+        return offset & ~(alignment-1)
+
+    def misalignment(self, offset, *, alignment=None):
+        """Return the offset relative to its lower alignment boundry
+
+        If alignment is not provided, the current object's block alignment will
+        be used (1 when no encryption is used, 16 for CTR, the sector size for XTS)
+        """
+        if alignment is None:
+            alignment = self._alignment
+        elif not is_power_of_2(alignment):
+            raise ValueError("Alignment must be a power of 2")
+
+        return offset & ~-alignment
 
     def _is_buffered(self, offset, size):
         """Check if the current offset+size is already in the buffer"""
@@ -675,7 +787,7 @@ class BaseIO(UnbufferedBaseIO):
         self.seek(pos + size)
 
         offset = pos - self._buff_offset
-        return self._buff[offset : offset + size]
+        return bytes(self._buff[offset : offset + size])
 
     def write(self, b: bytes, check_bounds=True):
         """Will write the object the the buffer
@@ -723,24 +835,12 @@ class Filesystem(BaseIO):
     def __iter__(self):
         return iter(self.files)
 
-    @staticmethod
-    def cls_from_fsheader(hdr: bytes):
-        fs_type = hdr[0x3]
-
-        if fs_type == FsType.PFS0:
-            return Pfs0
-        elif fs_type == FsType.ROMFS:
-            return RomFS
-
-        return Filesystem
-
 
 class Hfs0FileEntry(BaseIO):
 
     static_size = 0x40
 
     def parse(self):
-        self.seek(0)
         self.file_offset = self.read_uint64()
         self.file_size = self.read_uint64()
         self.name_offset = self.read_uint32()
@@ -749,44 +849,103 @@ class Hfs0FileEntry(BaseIO):
         self.sha256 = self.read(0x20)
 
         # null-terminated strings
+        self.name = self.parent.string_table[self.name_offset:].split(b"\x00", 1)[0].decode("utf-8")
+
+
+class Pfs0FileEntry(BaseIO):
+
+    static_size = 0x18
+
+    def parse(self):
+        self.file_offset = self.read_uint64()
+        self.file_size = self.read_uint64()
+        self.name_offset = self.read_uint32()
+        self.skip(0x4) # padding/reserved
+
+        # null-terminated strings
         self.name = self.parent.string_table[self.name_offset:].split(b"\0", 1)[0].decode("utf-8")
 
 
-class Hfs0(Filesystem):
+class _xfs0Filesystem(Filesystem):
+    """Adapater for Pfs0 and Hfs0 filesytems"""
+
+    def __init__(self, *args, file_entry_cls, **kwargs):
+        self._file_entry_cls = file_entry_cls
+        super().__init__(*args, **kwargs)
+
+    def _parse_files(self, data_start):
+        for f in self:
+            self._parse_file(data_start, f)
+
+    def _parse_file(self, data_start, f):
+        """Iterates over the header and reads the files"""
+        cls = class_from_name(f.header.name)
+        self.seek(data_start + f.header.file_offset)
+        f.data = self.read_object(cls(size=f.header.file_size))
 
     def parse(self):
-        self.magic = self.read_expected(b"HFS0")
+        if self._file_entry_cls == Hfs0FileEntry:
+            self.magic = self.read_expected(b"HFS0")
+        elif self._file_entry_cls == Pfs0FileEntry:
+            self.magic = self.read_expected(b"PFS0")
+        else:
+            raise ValueError("Invalid file entry class {}".format(self._file_entry_cls))
+
         self.num_files = self.read_uint32()
         self.string_table_size = self.read_uint32()
         self.skip(0x4) # padding/reserved
 
         # Skip forward to get the string table before parsing the filenames
         pos = self.tell()
-        self.skip(self.num_files * Hfs0FileEntry.static_size)
+        self.skip(self.num_files * self._file_entry_cls.static_size)
         self.string_table = self.read(self.string_table_size)
 
         # Note the end of the string table (file data is relative to here)
         data_start = self.tell()
         self.seek(pos)
 
-        for i in range(self.num_files):
-            f = self.read_object(Hfs0FileEntry())
+        for _ in range(self.num_files):
+            f = self.read_object(self._file_entry_cls())
             self.files.append(File(f))
 
-        for f in self:
-            hdr = f.header
-            cls = class_from_name(hdr.name)
-            self.seek(data_start + hdr.file_offset)
-            f.data = self.read_object(cls(size=hdr.file_size))
+        self._parse_files(data_start)
 
 
-class Pfs0(Filesystem):
-    pass
+class Hfs0(_xfs0Filesystem):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, file_entry_cls=Hfs0FileEntry, **kwargs)
+
+
+class Pfs0(_xfs0Filesystem):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, file_entry_cls=Pfs0FileEntry, **kwargs)
 
 
 class Nsp(Pfs0):
     """A Pfs0 with some extra restrictions/functionality"""
-    pass
+
+    def __init__(self, *args, **kwargs):
+        self._ticket = None
+        super().__init__(*args, **kwargs)
+
+    def _parse_files(self, data_start):
+        # If the NSP contains a ticket parse it first so we can use it to
+        # decrypt the rest of the contents
+        for f in self:
+            if class_from_name(f.header.name) == Ticket:
+                self._parse_file(data_start, f)
+                self._ticket = f.data
+
+        for f in self:
+            if f.data:
+                continue
+            self._parse_file(data_start, f)
+
+    @property
+    def ticket(self):
+        return self._ticket
 
 
 class RomFS(Filesystem):
@@ -798,6 +957,7 @@ class GameCardCert(BaseIO):
     static_size=0x70
 
     def parse(self):
+        # TODO
         self.cert_raw = self.read()
 
 
@@ -806,6 +966,7 @@ class GameCardInfo(BaseIO):
     static_size=0x70
 
     def parse(self):
+        # TODO
         self.raw_enc_data = self.read()
 
 
@@ -817,18 +978,18 @@ class Xci(BaseIO):
         self.secure_offset = self.read_uint32()
         self.backup_offset = self.read_uint32()
         self.title_kek_index = self.read_uint8()
-        self.gamecard_size = self.read_uint8() # enum
+        self.gamecard_size = self.read_uint8() # TODO: enum
         self.gamecard_header_version = self.read_uint8()
         self.gamecard_flags = self.read_uint8()
         self.package_id = self.read_uint64()
-        self.valid_data_end_address = self.read_uint64() # in MEDIA_UNITS
+        self.valid_data_end_address = self.read_uint64() * MEDIA_UNITS
         self.gamecard_info_iv = self.read(0x10)
 
         self.hfs0_offset = self.read_uint64()
         self.hfs0_header_size = self.read_uint64()
         self.hfs0_header_hash = self.read(0x20)
         self.hfs0_initial_data_hash = self.read(0x20)
-        self.security_mode = self.read_uint32() # enum (0x01 = T1, 0x02 = T2)
+        self.security_mode = self.read_uint32() # TODO: enum (0x01 = T1, 0x02 = T2)
         self.t1_key_index = self.read_uint32()
         self.t2_key_index = self.read_uint32()
         self.normal_area_end_address = self.read_uint32() # in MEDIA_UNITS
@@ -838,7 +999,7 @@ class Xci(BaseIO):
         self.gamecard_cert = self.read_object(GameCardCert())
 
         self.seek(self.hfs0_offset)
-        self.hfs0 = self.read_object(
+        self.filesystem = self.read_object(
             Hfs0(
                 header_size=self.hfs0_header_size,
                 header_hash=self.hfs0_header_hash,
@@ -869,9 +1030,17 @@ class NcaFsEntry(BaseIO):
     static_size = 0x10
 
     def parse(self):
-        self.start_offset = self.read_uint32()
-        self.end_offset = self.read_uint32()
+        self.start_offset = self.read_uint32() * MEDIA_UNITS
+        self.end_offset = self.read_uint32() * MEDIA_UNITS
         self.skip(0x8) # reserved
+
+    @property
+    def fs_size(self):
+        return self.end_offset - self.start_offset
+
+    @property
+    def is_padding(self):
+        return self.start_offset == 0 and self.end_offset == 0
 
 
 class NcaHeader(BaseIO):
@@ -883,75 +1052,367 @@ class NcaHeader(BaseIO):
             method=EncryptionType.AES_XTS,
             key=header_key
         )
+
         super().__init__(*args, encryption=encryption, **kwargs)
 
-    # TODO: unused?
+    @property
     def has_title_rights(self):
-        return self._rights_id != b"0"*32
+        return self.rights_id != "0"*32
 
     def parse(self):
         self.signature1 = self.read(0x100)
         self.signature2 = self.read(0x100)
         self.magic = self.read_expected(b"NCA3") # TODO: support old versions?
         self.distribution_type = self.read_uint8() # enum 0x00 = System NCA, 0x01 = Gamecard NCA
-        self.content_type = try_enum(ContentType, self.read_uint8())
-        self.key_generation_old = try_enum(KeyGeneration, self.read_uint8())
+        self.content_type = self.read_enum(0x1, NcaContentType)
+        self.key_generation_old = self.read_enum(0x1, KeyGeneration)
         self.key_area_encryption_key_index = self.read_uint8() # enum KeyAreaEncryptionKeyIndex (0x00 = Application, 0x01 = Ocean, 0x02 = System)
         self.content_size = self.read_uint64()
-        self.program_id = hexlify(self.read(8)[::-1]).decode("utf-8").upper()
+        self.program_id = self.read_hex(0x8, reverse=True)
         self.content_index = self.read_uint32()
         self.sdk_addon_version = self.read_uint32()
-        self.key_generation_new = try_enum(KeyGeneration, self.read_uint8())
+        self.key_generation_new = self.read_enum(0x1, KeyGeneration)
         self.header1_sig_key_generation = self.read_uint8()
         self.skip(0xE) # reserved
-        self.rights_id = hexlify(self.read(0x10)).upper()
+        self.rights_id = self.read_hex(0x10)
 
         self.sections = [self.read_object(NcaFsEntry()) for _ in range(4)]
         self.header_sha256_hashes = [self.read(0x20) for x in self.sections]
 
-        key_generation = try_enum(
-            KeyGeneration, max(self.key_generation_old, self.key_generation_new)
+        self._key_generation = KeyGeneration(
+           max(self.key_generation_old, self.key_generation_new)
         )
 
         encrypted_key_block = self.read(0x40)
-        key_block = self.console_keys.unwrap_title_key(encrypted_key_block, self.console_keys.master_key_index(key_generation))
+        key_block = self.console_keys.unwrap_title_key(encrypted_key_block, self.console_keys.master_key_index(self._key_generation))
         self.keys = [
             key_block[i * 0x10: (i+1) * 0x10]
             for i in range(4)
         ]
 
+
+    def _parent_nsp(self):
+        """Traverse up the hierarchy to find the NSP container this header is inside"""
+        p = self._parent
+        while p:
+            if isinstance(p, Nsp):
+                return p
+            p = p._parent
+        return None
+
+    @property
+    def decryption_key(self):
+        if self.has_title_rights:
+            nsp = self._parent_nsp()
+            if not nsp:
+                raise ValueError("Not inside an NSP - no title key available")
+
+            ticket = nsp.ticket
+            if not ticket:
+                raise ValueError("No ticket found inside NSP {}".format(nsp))
+
+            return self.console_keys.decrypt_title_key(
+                ticket.title_key, self.console_keys.master_key_index(self._key_generation)
+            )
+        return self.keys[2] # TODO: why 2?
+
+
+class HashInfo(BaseIO):
+    static_size = 0xF8
+
+
+class HierarchicalSha256(HashInfo):
+
+    def parse(self):
+        self.hash = self.read(0x20)
+        self.block_size = self.read_uint32()
+        self.read_expected(b"\x02\x00\x00\x00")
+        self.table_offset = self.read_uint64()
+        self.table_size = self.read_uint64()
+        self.relative_offset = self.read_uint64()
+        self.pfs0_size = self.read_uint64()
+        self.skip(0xB0) # reserved
+
+
+class HierarchicalIntegrityLevel(BaseIO):
+
+    static_size = 0x18
+
+    def parse(self):
+        self.level_offset = self.read_uint64()
+        self.level_size = self.read_uint64()
+        self.block_size = self.read_uint32()
+        self.read(0x4) # padding
+
+
+class HierarchicalIntegrity(HashInfo):
+
+    def parse(self):
+        self.magic = self.read_expected(b"IVFC")
+        self.read_expected(b"\x00\x00\x02\x00")
+        self.master_hash_size = self.read_uint32()
+        self.num_levels = self.read_uint32()
+
+        self.levels = [
+            self.read_object(HierarchicalIntegrityLevel())
+            for _ in range(self.num_levels - 1)
+        ]
+
+        self.skip(0x20) # padding/reserved
+        self.hash = self.read(0x20)
+        self.skip(0x18) # padding
+
+
+class HierarchicalSha256Table(BaseIO):
+
+    def __init__(self, *args, hash_info: HierarchicalSha256, **kwargs):
+        self._hi = hash_info
+        super().__init__(*args, size=hash_info.relative_offset, **kwargs)
+
+    def parse(self):
+        self.skip(self._hi.table_offset)
+        self.hash_table = self.read(self._hi.table_size) # TODO
+
+        # padding
+        self.skip(self._hi.relative_offset - self._hi.table_size)
+
+
+class BktrInfo(BaseIO):
+    static_size = 0x20
+
+    def parse(self):
+        self.entry_offset = self.read_uint64()
+        self.entry_size = self.read_uint64()
+        self.read_expected(b'BKTR')
+
+        # TODO: What are these?
+        self.u32 = self.read_uint32()
+        self.s32 = self.read_int32()
+
+        self.skip(0x4) # padding
+
+
+class PatchInfo(BaseIO):
+    """
+    Stores the BKTR section information
+    """
+    static_size = 0x40
+
+    def parse(self):
+        # Check for a totally null PatchInfo
+        if self.peek(self.static_size) == bytes(self.static_size):
+            self.entries = []
+            return
+
+        self.entries = [
+            self.read_object(BktrInfo())
+            for _ in range(2)
+        ]
+
+    @property
+    def is_padding(self):
+        return not self.entries
+
+
 class NcaFsHeader(BaseIO):
     static_size = 0x200
 
+    def __init__(self, *args, header_key, encryption_offset=0, **kwargs):
+        encryption = EncryptionScheme(
+            method=EncryptionType.AES_XTS,
+            key=header_key,
+            initial_offset=encryption_offset
+        )
+        super().__init__(*args, encryption=encryption, **kwargs)
+
     def parse(self):
-        self.version = self.read_uint16()
-        self.fs_type = try_enum(FsType, self.read_uint8())
-        self.hash_type = self.read_uint8() # enum HashType (0 = Auto, 2 = HierarchicalSha256, 3 = HierarchicalIntegrity)
-        self.encryption_type = try_enum(EncryptionType, self.read_uint8())
-        self.skip(0x1) # padding
-        self.hash_info = self.read(0xF8) # TODO: break out into class
-        self.patch_info = self.read(0x40) # TODO: break out into class
+        self.version = self.read_expected(b'\x02\x00')
+        self.fs_type = self.read_enum(0x1, FsType)
+        self.hash_type = self.read_enum(0x1, HashType)
+        self.encryption_type = self.read_enum(0x1, EncryptionType)
+        self.skip(0x3) # padding
+        self.hash_info = self.read_object(hashinfo_from_type(self.hash_type)())
+        self.patch_info = self.read_object(PatchInfo())
         self.generation = self.read(0x4)
         self.secure_value = self.read(0x4)
         self.sparce_info = self.read(0x30)
         self.skip(0x88) # reserved
 
+
+class NcaSection(BaseIO):
+    """A section of an NCA (including the header and hash tables)"""
+
+    def __init__(self, *args, nca_header, fs_header, encryption_offset, **kwargs):
+
+        # RomFS uses the CTR_EX by default
+        encryption_type = fs_header.encryption_type
+        if encryption_type == EncryptionType.AUTO and fs_header.fs_type == FsType.ROMFS:
+            encryption_type = EncryptionType.AES_CTR_EX
+
+        encryption = EncryptionScheme(
+            method=encryption_type,
+            key=nca_header.decryption_key,
+            nonce=(fs_header.generation + fs_header.secure_value)[::-1] + bytes(8),
+            initial_offset=encryption_offset
+        )
+        self.header = fs_header
+
+        super().__init__(*args, encryption=encryption, **kwargs)
+
+    def parse(self):
+        fs_size = None
+
+        # Special case:
+        # When using HierarchicalSha256 HashInfo there is a table preceeding
+        # the filesystem (which is always a Pfs0).
+        if self.header.hash_type == HashType.H_SHA_256:
+            self.hash_table = self.read_object(
+                HierarchicalSha256Table(hash_info=self.header.hash_info)
+            )
+            fs_size = self.header.hash_info.pfs0_size
+
+        # skip to next aligned block
+        self.seek(self.aligned(self.tell(), upper=True))
+
+        # Assume the filesystem completely fills the NcaSection unless a
+        # HierarchicalSha256 HashInfo in the header says otherwise.
+        fs_size = fs_size or self.size - self.tell()
+
+        self.filesystem = self.read_object(
+            filesystem_from_type(self.header.fs_type)(size=fs_size)
+        )
+
+
 class Nca(BaseIO):
 
     def parse(self):
-        header = self.read_object(NcaHeader(header_key=self.console_keys['header_key']))
-        # TODO: In pre NCA3 the sector count is reset to 0 per header
-        #       In NCA3+ it's teleative to the start of the entire NCA
-        # TODO: decrypt before continuing
-        #for s in header.sections:
-        #    self.read_object(NcaFsHeader())
+        header = self.read_object(
+                NcaHeader(
+                    header_key=self.console_keys['header_key']
+                )
+        )
+        self.filesystem_headers = []
+        for s in header.sections:
+            if s.is_padding:
+                self.skip(NcaFsHeader.static_size)
+                self.filesystem_headers.append(None)
+            else:
+                self.filesystem_headers.append(
+                    self.read_object(
+                        # TODO: In pre NCA3 the sector count is reset to 0 per header
+                        #       In NCA3+ it's relative to the start of the entire NCA
+                        NcaFsHeader(
+                            header_key=self.console_keys['header_key'],
+                            encryption_offset=self.tell()
+                        )
+                    )
+                )
+
+        self.filesystems = []
+        for section_hdr, fs_hdr in zip(header.sections, self.filesystem_headers):
+            if fs_hdr is None:
+                continue
+
+            self.seek(section_hdr.start_offset)
+            self.filesystems.append(
+                self.read_object(
+                    NcaSection(
+                        size=section_hdr.fs_size,
+                        fs_header=fs_hdr,
+                        nca_header=header,
+                        encryption_offset=self.tell()
+                    )
+                )
+            )
+
+
+class CnmtContentMetaInfo(BaseIO):
+
+    static_size = 0x10
+
+    def parse(self):
+        self.program_id = self.read_hex(0x8, reverse=True)
+        self.version = self.read_uint32()
+        self.content_meta_type = self.read_enum(0x01, ContentMetaType)
+        self.content_meta_attrs = self.read(0x1) # (0=None, 1=IncludesExFatDriver, 2=Rebootless)
+        self.skip(0x2) # reserved
+
+
+class CnmtPackagedContentInfo(BaseIO):
+
+    static_size = 0x38
+
+    def parse(self):
+        self.hash = self.read(0x20)
+        self.content_id = self.read_hex(0x10)
+        self.content_size = self.read_uint(0x6)
+        self.content_type = self.read_enum(0x1, CnmtContentType)
+        self.id_offset = self.read_uint8()
+
 
 class Cnmt(BaseIO):
-    pass
+    """PackagedContentMeta"""
+
+    def parse(self):
+        self.program_id = self.read_hex(0x8, reverse=True)
+        self.version = self.read_uint32()
+        self.content_meta_type = self.read_enum(0x01, ContentMetaType)
+        self.skip(0x01) # reserved
+        self.extended_header_size = self.read_uint16()
+        self.content_count = self.read_uint16()
+        self.content_meta_count = self.read_uint16()
+        self.content_meta_attrs = self.read(0x1) # (0=None, 1=IncludesExFatDriver, 2=Rebootless)
+        self.skip(0x3) # padding
+        self.required_system_version = self.read_uint32()
+        self.skip(0x4) # reserved
+
+        # TODO: Parse into objects
+        self.extended_header = self.read(self.extended_header_size)
+
+        self.content = [
+            self.read_object(CnmtPackagedContentInfo())
+            for _ in range(self.content_count)
+        ]
+        self.meta = [
+            self.read_object(CnmtContentMetaInfo())
+            for _ in range(self.content_meta_count)
+        ]
+
+        # TODO: parse this data based on the extended_header
+        self.extended_data = self.read(self.size - self.tell() - 0x20)
+
+        self.digest = self.read(0x20)
 
 
 class Ticket(BaseIO):
-    pass
+
+    def parse(self):
+        self.signature_type = self.read_enum(0x4, TicketSignatureType)
+        self.signature = self.read(TICKET_SIGNATURE_SIZES[self.signature_type])
+
+        # skip to next 0x40-aligned block
+        self.seek(self.aligned(self.tell(), upper=True, alignment=0x40))
+
+        self.issuer = self.read_string(0x40)
+        self.title_key_block = self.read(0x100)
+        self.skip(0x1) # unknown/padding
+        self.title_key_type = self.read_uint8()
+        self.skip(0x3) # unknown/padding
+        self.master_key_rev = self.read_uint8()
+        self.skip(0xA) # unknown/padding
+        self.ticket_id = self.read_hex(0x8)
+        self.device_id = self.read_hex(0x8)
+        self.rights_id = self.read_hex(0x10)
+        self.account_id = self.read_hex(0x4)
+
+        self.skip(0xC) # padding/reserved/unknown
+
+    @property
+    def title_key(self):
+        if self.title_key_type != 0:
+            return None
+        return self.title_key_block[:0x10]
+        return hexlify(self.title_key_block[:0x10]).decode("utf-8").upper()
 
 
 class Nacp(BaseIO):
@@ -970,18 +1431,24 @@ class GamecardCertificate(Struct):
     pass
 
 
-class HierarchicalIntegrityHash(BaseIO):
-    """Ivfc"""
+def hashinfo_from_type(hash_type):
+    if hash_type == HashType.H_SHA_256:
+        return HierarchicalSha256
+    elif hash_type == HashType.H_INTEGRITY:
+        return HierarchicalIntegrity
+    elif hash_type == HashType.AUTO:
+        return HashInfo
 
-    pass
+    raise ValueError("Unknown hash type {}".format(hash_type))
 
 
-class PatchInfo(BaseIO):
-    """
-    Stores the BKTR sections
-    """
+def filesystem_from_type(fs_type):
+    if fs_type == FsType.PFS0:
+        return Pfs0
+    elif fs_type == FsType.ROMFS:
+        return RomFS
 
-    pass
+    raise ValueError("Unknown filesystem type {}".format(fs_type))
 
 
 def class_from_name(name):

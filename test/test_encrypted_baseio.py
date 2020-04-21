@@ -110,11 +110,11 @@ def test_initial_sector_offset():
         method=EncryptionType.AES_XTS,
         key=b'\xaa' * 0x20,
         sector_size=0x10,
-        iv=3,
+        initial_offset=3,
     )
 
     encrypted_write = aes128.AESXTS(
-        keys=enc.key, initial_sector=enc.iv, sector_size=enc.sector_size
+        keys=enc.key, initial_offset=enc.initial_offset, sector_size=enc.sector_size
     ).encrypt(to_write)
 
     data = io.BytesIO(initial)
