@@ -28,6 +28,14 @@ KEY_CHECKSUMS = {
     "master_key_07": 1146095808,
     "master_key_08": 1605958034,
     "master_key_09": 3456782962,
+    "master_key_0a": 2012895168,
+    "master_key_0b": 3813624150,
+    "master_key_0c": 3881579466,
+    "master_key_0d": 723654444,
+    "master_key_0e": 2690905064,
+    "master_key_0f": 4082108335,
+    "master_key_10": 788455323,
+    "master_key_11": 1214507020,
 }
 
 
@@ -86,7 +94,7 @@ class ConsoleKeys:
 
     # getMasterKey
     def master_key(self, i):
-        return self["master_key_{0:02}".format(i)]
+        return self["master_key_{:02x}".format(i)]
 
     # keyAreaKey
     def key_area_key(self, crypto_type, i):

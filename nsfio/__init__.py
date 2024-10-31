@@ -1094,6 +1094,14 @@ class KeyGeneration(IntEnum):
     v8_1_0 = 0x09
     v9_0_0 = 0x0A
     v9_1_0 = 0x0B
+    v12_1_0 = 0x0C
+    v13_0_0 = 0x0D
+    v14_0_0 = 0x0E
+    v15_0_0 = 0x0F
+    v16_0_0 = 0x10
+    v17_0_0 = 0x11
+    v18_0_0 = 0x12
+    v19_0_0 = 0x13
     INVALID = 0xFF
 
 
