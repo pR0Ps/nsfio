@@ -8,9 +8,20 @@ from nsfio.keys import ConsoleKeys
 from nsfio import aes128
 from dataclasses import dataclass
 
-from binascii import hexlify, unhexlify
+from binascii import hexlify
+
 
 __log__ = logging.getLogger(__name__)
+
+
+# Add level for debugging low-level IO
+def _add_log_level(level, name):
+    name = name.upper()
+    setattr(logging, name, level)
+    setattr(logging.getLoggerClass(), name.lower(), lambda s, *a, **k: s.log(getattr(logging, name), *a, **k))
+    logging.addLevelName(level, name)
+
+_add_log_level(5, "IOTRACE")
 
 
 ########################################
@@ -268,11 +279,11 @@ class UnbufferedBaseIO:
         if size is None:
             size = self.size - self.tell()
 
-        # Only log this out if debug is enabled and its not the super() call
-        # from a buffered read
-        if __log__.isEnabledFor(logging.DEBUG):
+        # Only log this out if io tracing is enabled and its not the super()
+        # call from a buffered read
+        if __log__.isEnabledFor(logging.IOTRACE):
             if not isinstance(self, BaseIO):
-                __log__.debug("       Reading: %5d bytes from %s", size, self)
+                __log__.iotrace("       Reading: %5d bytes from %s", size, self)
 
         if size <= 0:
             return b""
@@ -283,7 +294,7 @@ class UnbufferedBaseIO:
         if self.parent:
             return self.parent.read(size, check_bounds=False)
         else:
-            __log__.debug("       Reading: %5d bytes from <stream>", size)
+            __log__.iotrace("       Reading: %5d bytes from <stream>", size)
             return self._io.read(size)
 
     def read_object(self, obj: "UnbufferedBaseIO"):
@@ -403,11 +414,11 @@ class UnbufferedBaseIO:
         if not size:
             return 0
 
-        # Only log this out if debug is enabled and its not the super() call
-        # from a buffer sync
-        if __log__.isEnabledFor(logging.DEBUG):
+        # Only log this out if io tracing is enabled and its not the super()
+        # call from a buffer sync
+        if __log__.isEnabledFor(logging.IOTRACE):
             if not isinstance(self, BaseIO):
-                __log__.debug("       Writing: %5d bytes to %s", size, self)
+                __log__.iotrace("       Writing: %5d bytes to %s", size, self)
 
         if check_bounds:
             self._check_offset(self.tell(), size)
@@ -415,13 +426,13 @@ class UnbufferedBaseIO:
         if self.parent:
             return self.parent.write(b, check_bounds=False)
         else:
-            __log__.debug("       Writing: %5d bytes to <stream>", len(b))
+            __log__.iotrace("       Writing: %5d bytes to <stream>", len(b))
             return self._io.write(b)
 
     def write_object(self, obj: "UnbufferedBaseIO"):
         """Write an object to the bytestream using its serialize function"""
 
-        __log__.debug("Writing %s to %s", obj, self)
+        __log__.iotrace("Writing %s to %s", obj, self)
         obj.serialize()
         obj.seek(0, io.SEEK_END)
         return obj.size
@@ -706,7 +717,7 @@ class BaseIO(UnbufferedBaseIO):
             read_left = overlap_start - new_buff_offset
             read_right = new_buff_end - overlap_end
 
-        __log__.debug("     Buffering: %5d bytes from %s", read_left + overlap_size + read_right, self)
+        __log__.iotrace("     Buffering: %5d bytes from %s", read_left + overlap_size + read_right, self)
 
         # Optimization:
         # Figure out which blocks to exclude from reading if we're just going
@@ -748,7 +759,7 @@ class BaseIO(UnbufferedBaseIO):
         if self._buff and self._dirty:
             p = self.tell()
 
-            __log__.debug(" Write buffer: %5d bytes to %s", len(self._buff), self)
+            __log__.iotrace(" Write buffer: %5d bytes to %s", len(self._buff), self)
 
             to_write = self._buff
             if self._crypt:
@@ -779,7 +790,7 @@ class BaseIO(UnbufferedBaseIO):
         if size <= 0:
             return b""
 
-        __log__.debug(" Buffered read: %5d bytes from %s", size, self)
+        __log__.iotrace(" Buffered read: %5d bytes from %s", size, self)
 
         self._load_buffer(pos, size)
 
@@ -799,7 +810,7 @@ class BaseIO(UnbufferedBaseIO):
         if not size:
             return 0
 
-        __log__.debug("Buffered write: %5d bytes to %s", size, self)
+        __log__.iotrace("Buffered write: %5d bytes to %s", size, self)
 
         pos = self.tell()
 
