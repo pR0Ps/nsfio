@@ -1284,8 +1284,7 @@ class PatchInfo(BaseIO):
             return
 
         self.entries = [
-            self.read_object(BktrInfo())
-            for _ in range(2)
+            self.read_object(BktrInfo()) for _ in range(2)
         ]
 
     @property
@@ -1316,6 +1315,74 @@ class NcaFsHeader(BaseIO):
         self.secure_value = self.read(0x4)
         self.sparce_info = self.read(0x30)
         self.skip(0x88) # reserved
+
+
+class BktrRelocationEntry(BaseIO):
+    static_size = 0x14
+
+    def parse(self):
+        self.dest_offset = self.read_uint64()
+        self.source_offset = self.read_uint64()
+        self.source = self.read_uint32() # 1=Is from Patch RomFS, 0=Is from Base RomFS
+
+
+class BktrSubsectionEntry(BaseIO):
+    static_size = 0x10
+
+    def parse(self):
+        self.patch_offset = self.read_uint64()
+        self.skip(0x4) # padding/unused
+        self.crypt_nonce = self.read(0x4)
+
+
+class BktrBucket(BaseIO):
+    static_size = 0x4000
+
+    def __init__(self, entry_type, *args, **kwargs):
+        assert entry_type in (BktrRelocationEntry, BktrSubsectionEntry)
+        self.entry_type = entry_type
+        super().__init__(*args, **kwargs)
+
+    def parse(self):
+        self.skip(0x4) # padding/unused
+        self.num_entries = self.read_uint32()
+        self.end_offset = self.read_uint64()
+
+        self.entries = [
+            self.read_object(self.entry_type())
+            for _ in range(self.num_entries)
+        ]
+
+    def __iter__(self):
+        return iter(self.entries)
+
+
+class BktrEntry(BaseIO):
+
+    def __init__(self, entry_type, *args, **kwargs):
+        assert entry_type in (BktrRelocationEntry, BktrSubsectionEntry)
+        self.entry_type = entry_type
+        super().__init__(*args, **kwargs)
+
+    def parse(self):
+
+        self.skip(0x4) # padding/unused
+        self.num_buckets = self.read_uint32()
+        self.total_size = self.read_uint64()
+
+        self.bucket_offsets = [
+            self.read_uint64()
+            for _ in range(self.num_buckets)
+        ]
+
+        self.seek(0x4000)
+        self.buckets = [
+            self.read_object(BktrBucket(entry_type=self.entry_type))
+            for _ in range(self.num_buckets)
+        ]
+
+    def __iter__(self):
+        return iter(self.buckets)
 
 
 class NcaSection(BaseIO):
@@ -1350,17 +1417,95 @@ class NcaSection(BaseIO):
             )
             fs_size = self.header.hash_info.pfs0_size
 
-        # skip to next aligned block
-        self.seek(self.aligned(self.tell(), upper=True))
+        # The filsystem starts at the next aligned block
+        fs_start = self.aligned(self.tell(), upper=True)
+
+        # Special case:
+        # Where patch information is used, there are Bktr entries. These need
+        # to be parsed before a PatchRomFS entry can be decrypted
+        self.bktr_relocations = None
+        self.bktr_subsections = None
+        if not self.header.patch_info.is_padding:
+            # Parse relocation then subsection buckets
+            bktr = []
+            for entry_type, entry_info in zip((BktrRelocationEntry, BktrSubsectionEntry), self.header.patch_info.entries):
+                self.seek(entry_info.entry_offset)
+                bktr.append(self.read_object(
+                    BktrEntry(
+                        entry_type=entry_type,
+                        size=entry_info.entry_size
+                    )
+                ))
+            self.bktr_relocations, self.bktr_subsections = bktr
 
         # Assume the filesystem completely fills the NcaSection unless a
         # HierarchicalSha256 HashInfo in the header says otherwise.
-        fs_size = fs_size or self.size - self.tell()
+        fs_size = fs_size or self.size - fs_start
+        self.seek(fs_start)
 
-        self.filesystem = self.read_object(
-            filesystem_from_type(self.header.fs_type)(size=fs_size)
+        if self.has_bktr:
+            self.filesystem = self.read_object(
+                PatchRomFS(
+                    size=fs_size,
+                    bktr_relocations=self.bktr_relocations,
+                    bktr_subsections=self.bktr_subsections
+                )
+            )
+        else:
+            self.filesystem = self.read_object(
+                filesystem_from_type(self.header.fs_type)(size=fs_size)
+            )
+
+    @property
+    def has_bktr(self):
+        return self.bktr_relocations and self.bktr_subsections
+
+
+class BktrSubsectionData(BaseIO):
+    def __init__(self, *args, entry: BktrSubsectionEntry, nca_header, **kwargs):
+        # TODO: confirm decryption works
+        encryption = EncryptionScheme(
+            method=EncryptionType.AES_CTR,
+            key=nca_header.decryption_key, # TODO: is this right?
+            nonce=entry.crypt_nonce + bytes(12) # TODO: needs to be 16 bytes and is only 4? pad it?
         )
+        super().__init__(*args, encryption=encryption, **kwargs)
 
+    def parse(self):
+        self.read()
+
+
+class PatchRomFS(BaseIO):
+    def __init__(self, *args, bktr_relocations, bktr_subsections, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._relocations = bktr_relocations
+        self._subsections = bktr_subsections
+
+    @staticmethod
+    def _sized_subsection_entries(subsection):
+        # Subsections are sorted by offset - use the differences to compute their sizes
+        prev = None
+        for entry in subsection:
+            if prev is not None:
+                yield prev, entry.patch_offset-prev.patch_offset
+            prev = entry
+        yield prev, subsection.end_offset-prev.patch_offset
+
+
+    def parse(self):
+        # NOTE:
+        # self._relocations are patches to an existng RomFS - nothing to parse for them
+
+        # Decrypt the patches
+        for subsection in self._subsections:
+            for entry, size in self._sized_subsection_entries(subsection):
+                self.read_object(
+                    BktrSubsectionData(
+                        entry=entry,
+                        size=size,
+                        nca_header=self.parent.parent.header # self -> NcaSection -> NcaHeader
+                    )
+                )
 
 @dataclass
 class NcaSectionData:
