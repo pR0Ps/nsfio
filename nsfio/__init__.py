@@ -178,6 +178,7 @@ class UnbufferedBaseIO:
         self._console_keys = console_keys
         self._children = []
         self._parent = None
+        self._parsed = False
 
     # Load data and parse
     def from_io(self, data: io.BufferedIOBase):
@@ -185,9 +186,7 @@ class UnbufferedBaseIO:
         if self.size is None:
             self._io.seek(0, io.SEEK_END)
             self._size = self.tell()
-        self._io.seek(0)
-        self.parse()
-        self.seek(0, io.SEEK_END)
+        self._parse()
         return self
 
     def from_file(self, path: Union[str, Path]):
@@ -229,6 +228,24 @@ class UnbufferedBaseIO:
     @property
     def children(self):
         return self._children
+
+    @property
+    def parsed(self):
+        return self._parsed
+
+    def _parse(self):
+        self.seek(0)
+        self.parse()
+
+        # Check for unparsed data at the end
+        pos = self.tell()
+        newpos = self.seek(0, io.SEEK_END)
+
+        skipped = newpos - pos
+        if skipped != 0:
+            __log__.debug("WARNING: Skipped %d bytes at the end of %s", skipped, self)
+
+        self._parsed = True
 
     # Define how to parse/serialize
     def parse(self):
@@ -310,6 +327,8 @@ class UnbufferedBaseIO:
         """
         if obj.size is None:
             raise ValueError("The size of the object to read must be known")
+        elif obj.size < 0:
+            raise ValueError("The size of the object cannot be negative ({})".format(obj.size()))
 
         offset = self.tell()
 
@@ -321,9 +340,7 @@ class UnbufferedBaseIO:
         __log__.debug("Reading %s from %s", obj, self)
 
         self._children.append(obj)
-
-        obj.parse()
-        obj.seek(0, io.SEEK_END)
+        obj._parse()
 
         return obj
 
@@ -964,6 +981,7 @@ class Nsp(Pfs0):
         for f in self:
             if class_from_name(f.header.name) == Ticket:
                 self._parse_file(data_start, f)
+                __log__.info("Found a ticket: %s", hexlify(f.data.title_key).decode("utf-8").upper())
                 self._ticket = f.data
 
         for f in self:
@@ -1131,13 +1149,14 @@ class NcaHeader(BaseIO):
     @property
     def decryption_key(self):
         if self.has_title_rights:
+            # TODO: what about within an _fs0??
             nsp = self._parent_nsp()
             if not nsp:
-                raise ValueError("Not inside an NSP - no title key available")
+                raise ValueError("No title key available (object is not in an NSP)")
 
             ticket = nsp.ticket
             if not ticket:
-                raise ValueError("No ticket found inside NSP {}".format(nsp))
+                raise ValueError("No title key available (no ticket found inside NSP {})".format(nsp))
 
             return self.console_keys.decrypt_title_key(
                 ticket.title_key, self.console_keys.master_key_index(self._key_generation)
@@ -1330,11 +1349,19 @@ class Nca(BaseIO):
                 header_key=self.console_keys['header_key']
             )
         )
+
+        # No decryption_key = skip with error
+        try:
+            self.header.decryption_key
+        except ValueError as e:
+            __log__.error("Can't decrypt %s: %s", self, e)
+            return
+
         self.sections = [
             NcaSectionData(location=x) for x in self.header.sections
         ]
 
-        # Parse filesystem headers
+        # Parse section headers
         for s in self:
             if s.location.is_padding:
                 self.skip(NcaFsHeader.static_size)
@@ -1348,7 +1375,7 @@ class Nca(BaseIO):
                     )
                 )
 
-        # Parse filesystems
+        # Parse sections
         for s in self:
             if s.location.is_padding:
                 continue
@@ -1496,4 +1523,5 @@ def class_from_name(name):
     elif name in set(["normal", "logo", "update", "secure"]):
         return Hfs0
     else:
+        __log__.warning("Unknown object named '%s'", name)
         return BaseIO
