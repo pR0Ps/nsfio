@@ -401,10 +401,11 @@ class UnbufferedBaseIO:
         elif size == 0:
             return b""
 
+        p = self.tell()
         try:
             return self.read(size)
         finally:
-            self.seek(-size, io.SEEK_CUR)
+            self.seek(p)
 
     def write(self, b: bytes, check_bounds=True):
         """Write bytes to the object
@@ -444,6 +445,12 @@ class UnbufferedBaseIO:
         return obj.size
 
     def seek(self, offset, whence=io.SEEK_SET):
+        """Seek to the provided offset
+
+        The `whence` param has the same meaning as in `io.seek`
+
+        Returns the offset of the seek point
+        """
         if whence == io.SEEK_SET:
             target = offset
         elif whence == io.SEEK_CUR:
@@ -459,9 +466,9 @@ class UnbufferedBaseIO:
             self._check_offset(target)
 
         if self.parent:
-            return self.parent.seek(self._offset + target, io.SEEK_SET)
+            return self.parent.seek(self._offset + target, io.SEEK_SET) - self._offset
         else:
-            return self._io.seek(self._offset + target, io.SEEK_SET)
+            return self._io.seek(self._offset + target, io.SEEK_SET) - self._offset
 
     def skip(self, offset):
         """Convenience function for seeking forwards"""
