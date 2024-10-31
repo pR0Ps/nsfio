@@ -34,6 +34,8 @@ def is_power_of_2(num: int):
 SIZE_SUFFIXES = ('B', 'KiB', 'MiB', 'GiB', 'TiB')
 
 def display_bytes(size):
+    if size is None:
+        return "??"
     exp = min(
         (int.bit_length(abs(size)) - 1) // 10,
         len(SIZE_SUFFIXES) - 1
@@ -224,6 +226,10 @@ class UnbufferedBaseIO:
     def parent(self):
         return self._parent
 
+    @property
+    def children(self):
+        return self._children
+
     # Define how to parse/serialize
     def parse(self):
         """Parse information out of the loaded stream"""
@@ -243,10 +249,10 @@ class UnbufferedBaseIO:
         return self.size
 
     def __repr__(self):
-        return "<{}{}{}>".format(
+        return "<{} size='{}' offset={:#x}>".format(
             self.__class__.__qualname__,
-            " size='{}'".format(display_bytes(self.size)) if hasattr(self, "_size") else "",
-            " offset='{:#x}'".format(self._offset) if hasattr(self, "_offset") else ""
+            display_bytes(self.size),
+            self._offset
         )
 
     def __iter__(self):
