@@ -859,6 +859,28 @@ class BaseIO(UnbufferedBaseIO):
         return size
 
 
+class NamedFileMixin:
+    """A mixin for classes that are named"""
+
+    def __init__(self, *args, name=None, **kwargs):
+        self._name = name
+        super().__init__(*args, **kwargs)
+
+
+    @property
+    def name(self):
+        return self._name
+
+    def __repr__(self):
+        if self.name:
+            return "<{} {} size='{}' offset={:#x}>".format(
+                self.__class__.__qualname__,
+                self.name,
+                display_bytes(self.size),
+                self._offset
+            )
+        return super().__repr__()
+
 
 class Filesystem(BaseIO):
     """Contains other objects"""
@@ -920,9 +942,13 @@ class _xfs0Filesystem(Filesystem):
 
     def _parse_file(self, data_start, f):
         """Iterates over the header and reads the files"""
-        cls = class_from_name(f.header.name)
         self.seek(data_start + f.header.file_offset)
-        f.data = self.read_object(cls(size=f.header.file_size))
+        f.data = self.read_object(
+            named_object(
+                name=f.header.name,
+                size=f.header.file_size
+            )
+        )
 
     def parse(self):
         if self._file_entry_cls == Hfs0FileEntry:
@@ -956,7 +982,7 @@ class _xfs0Filesystem(Filesystem):
         self._parse_files(data_start)
 
 
-class Hfs0(_xfs0Filesystem):
+class Hfs0(NamedFileMixin, _xfs0Filesystem):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, file_entry_cls=Hfs0FileEntry, **kwargs)
@@ -968,7 +994,7 @@ class Pfs0(_xfs0Filesystem):
         super().__init__(*args, file_entry_cls=Pfs0FileEntry, **kwargs)
 
 
-class Nsp(Pfs0):
+class Nsp(NamedFileMixin, Pfs0):
     """A Pfs0 with some extra restrictions/functionality"""
 
     def __init__(self, *args, **kwargs):
@@ -1016,7 +1042,7 @@ class GameCardInfo(BaseIO):
         self.raw_enc_data = self.read()
 
 
-class Xci(BaseIO):
+class Xci(NamedFileMixin, BaseIO):
 
     def parse(self):
         self.signature = self.read(0x100)
@@ -1087,6 +1113,12 @@ class NcaFsEntry(BaseIO):
     @property
     def is_padding(self):
         return self.start_offset == 0 and self.end_offset == 0
+
+    def __repr__(self):
+        if self.parsed and self.is_padding:
+            return "<NcaFsEntry [padding]>"
+        else:
+            return super().__repr__()
 
 
 class NcaHeader(BaseIO):
@@ -1337,7 +1369,7 @@ class NcaSectionData:
     section: NcaSection = None
 
 
-class Nca(BaseIO):
+class Nca(NamedFileMixin, BaseIO):
 
     def __init__(self, *args, **kwargs):
         self.sections = []
@@ -1418,7 +1450,7 @@ class CnmtPackagedContentInfo(BaseIO):
         self.id_offset = self.read_uint8()
 
 
-class Cnmt(BaseIO):
+class Cnmt(NamedFileMixin, BaseIO):
     """PackagedContentMeta"""
 
     def parse(self):
@@ -1452,7 +1484,7 @@ class Cnmt(BaseIO):
         self.digest = self.read(0x20)
 
 
-class Ticket(BaseIO):
+class Ticket(NamedFileMixin, BaseIO):
 
     def parse(self):
         self.signature_type = self.read_enum(0x4, TicketSignatureType)
@@ -1482,7 +1514,7 @@ class Ticket(BaseIO):
         return None
 
 
-class Nacp(BaseIO):
+class Nacp(NamedFileMixin, BaseIO):
     pass
 
 
@@ -1506,7 +1538,18 @@ def filesystem_from_type(fs_type):
     raise ValueError("Unknown filesystem type {}".format(fs_type))
 
 
+def named_object(*args, name, **kwargs):
+    """Uses the name to pick a class and instantiates it with the rest of the params"""
+
+    cls = class_from_name(name)
+    if issubclass(cls, NamedFileMixin):
+        return cls(*args, name=name, **kwargs)
+
+    return cls(*args, **kwargs)
+
+
 def class_from_name(name):
+    """Uses the name to determine which class of object to parse it as"""
     name = name.lower()
     if name.endswith(".xci"):
         return Xci
